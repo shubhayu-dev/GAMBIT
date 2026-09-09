@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# C++
+build/
+*.o
+*.obj
+CMakeFiles/
+CMakeCache.txt
+
+# Data (bulk, not committed)
+data/*.parquet
+data/*.db
+data/*.sqlite
+!data/README.md
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
