@@ -60,3 +60,15 @@ modified agent on held-out data → reports whether measurable improvement occur
 If this loop runs end to end, GAMBIT has met its MVP objective.
 
 See `/docs` for the detailed specs this constitution governs.
+
+## Addendum: classical + modern AI + LLM reasoning
+
+`docs/11_integration_addendum.md` documents a scope change, flagged per Rule 7
+below rather than silently absorbed: a neural (MLP) value agent, a
+classical-vs-neural disagreement signal, unsupervised anomaly detection, and an
+LLM reasoning layer (interpretation/hypothesis-proposal only — never move
+selection, never unrestricted self-modification) were added as new MUST-HAVE
+components. Read that addendum before assuming the original Section 5 "out of
+scope" list still excludes all neural/LLM work — it excludes deep RL and
+autonomous LLM agents specifically; a small supervised value net and a
+narrowly-scoped LLM reasoning layer are not the same thing.

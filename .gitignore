@@ -1,23 +1,69 @@
-# Python
-__pycache__/
-*.pyc
-.venv/
-venv/
+# Ignore massive dataset files and compressed archives
+data/**/*.csv
+data/**/*.zst
+data/lichess_raw/
 
-# C++
-build/
-*.o
-*.obj
-CMakeFiles/
-CMakeCache.txt
+# Ignore auto-generated trajectory JSONL logs (these get huge)
+data/trajectories_run_*.jsonl
 
-# Data (bulk, not committed)
-data/*.parquet
-data/*.db
-data/*.sqlite
+# Ignore generated diagnostic outputs and HTML reports
+data/*.json
 !data/README.md
+data/*.html
 
-# OS / editor
+# Ignore SQLite databases
+data/*.db
+data/*.sqlite3
+
+# Ignore PyTorch model weights/checkpoints
+data/*.pkl
+data/*.pt
+data/*.pth
+
+# ====================================================================
+# PYTHON SPECIFIC
+# ====================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+*.venv/
+
+# Pytest / Coverage caches
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+coverage.xml
+
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# VS Code
 .vscode/
+*.code-workspace
+
+# JetBrains (PyCharm / IntelliJ)
 .idea/
+*.iml
