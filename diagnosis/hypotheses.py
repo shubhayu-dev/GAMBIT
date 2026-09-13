@@ -1,41 +1,60 @@
 """
-Hypothesis generation (docs/10 Week 5, docs/09_experiment_protocol.md).
+Hypothesis Generation Registry (GAMBIT Step 11/12).
 
-For the MVP, hypotheses are generated from a fixed candidate set tied to the
-controllable knobs SearchAgent actually has (search depth, evaluation
-function, time budget) -- per the Constitution, GAMBIT proposes testable
-explanations, not vague diagnoses like "the agent is bad at X".
+This module defines the architectural parameter registry for the current agent.
+For the classical SearchAgent MVP, the hypotheses are deterministic and tied
+directly to the agent's exposed knobs: search depth, evaluation heuristics,
+and time budget. 
+
+By explicitly defining the `experiment_schema`, this acts as the exact JSON 
+template that the Gemini LLM Reasoner will use to dynamically generate and 
+execute its own A/B tests in future pipeline iterations.
 """
 
 from typing import Dict, List
 
 
 def generate_hypotheses(dimension: str) -> List[Dict]:
-    """Returns 3 candidate hypotheses for why the agent underperforms in
-    `dimension`, each mapped to a concrete, testable experiment condition."""
+    """
+    Generates concrete, testable hypotheses for agent underperformance in a given dimension.
+    Returns the hypothesis statement alongside the exact control/treatment parameters 
+    required for diagnostic_experiment.py to execute the A/B test.
+    """
     return [
         {
             "id": "H1",
-            "name": "Search depth limitation",
-            "statement": (f"The agent's search depth is insufficient to see far enough ahead "
-                           f"in {dimension} positions, causing high regret."),
-            "test": "Sweep search depth (shallow vs deep) at fixed time budget and evaluation "
-                    "function; measure regret on the weak-bucket positions.",
+            "name": "Search Depth Limitation",
+            "statement": (f"The agent's search depth is insufficient to resolve tactical "
+                          f"lines in {dimension} positions, resulting in high regret."),
+            "test": "Sweep search depth (shallow vs deep) at fixed time budget.",
+            "experiment_schema": {
+                "variable": "max_depth",
+                "control": 2,
+                "treatment": 4
+            }
         },
         {
             "id": "H2",
-            "name": "Evaluation-function weakness",
+            "name": "Evaluation Function Weakness",
             "statement": (f"The static evaluation function misjudges {dimension} positions "
-                           f"even when search finds the right lines, causing high regret."),
-            "test": "Ablate the evaluation function (material-only vs material+PST+mobility) "
-                    "at fixed depth and time budget; measure regret on the weak-bucket positions.",
+                          f"even when search explores the correct lines."),
+            "test": "Ablate the evaluation function (material-only vs material+PST).",
+            "experiment_schema": {
+                "variable": "evaluator",
+                "control": "material",
+                "treatment": "material_pst"
+            }
         },
         {
             "id": "H3",
-            "name": "Time budget insufficiency",
-            "statement": (f"The agent doesn't get enough thinking time to reach a useful depth "
-                           f"in {dimension} positions within the current time budget."),
-            "test": "Sweep time budget (short vs long) at fixed max depth; measure regret on "
-                    "the weak-bucket positions.",
+            "name": "Time Budget Insufficiency",
+            "statement": (f"The agent is compute-starved and cannot reach a useful depth "
+                          f"in {dimension} positions within the allotted time."),
+            "test": "Sweep time budget (100ms vs 600ms) with a high theoretical max depth.",
+            "experiment_schema": {
+                "variable": "time_budget_ms",
+                "control": 100,
+                "treatment": 600
+            }
         },
     ]

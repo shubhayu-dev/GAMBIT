@@ -1,10 +1,8 @@
 """
 Diagnostic experiments (docs/10 Week 6, docs/09_experiment_protocol.md).
 
-Runs the three hypotheses from hypotheses.py as controlled experiments on the
-weak-bucket positions only (never the held-out set -- that's reserved for
-Week 7's final validation). Each hypothesis becomes a paired A/B comparison:
-same positions, one factor changed, everything else held constant.
+Runs the candidate hypotheses as controlled experiments on the weak-bucket 
+positions dynamically, reading from the experiment_schema.
 """
 
 import sys
@@ -13,9 +11,9 @@ from typing import Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "engine"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments"))
-from agents import SearchAgent  # noqa: E402
-from evaluation import evaluate, evaluate_material_only  # noqa: E402
-from runner import run_experiment  # noqa: E402
+from engine.agents import SearchAgent  # noqa: E402
+from engine.evaluation import evaluate, evaluate_material_only  # noqa: E402
+from experiments.runner import run_experiment  # noqa: E402
 
 try:
     from scipy.stats import wilcoxon
@@ -51,53 +49,67 @@ def _paired_comparison(records_a: List[Dict], records_b: List[Dict], label_a: st
     }
 
 
-def run_diagnostic_suite(weak_positions: List[Dict], time_budget_ms: int = 300, seed: int = 100) -> Dict:
-    """Runs H1 (depth), H2 (evaluation quality), H3 (time budget) on the
-    given weak-bucket positions and returns evidence for each."""
+def run_diagnostic_suite(weak_positions: List[Dict], hypotheses: List[Dict], time_budget_ms: int = 300, seed: int = 100) -> Dict:
+    """Dynamically executes A/B tests based on the experiment_schema of each hypothesis."""
     if len(weak_positions) < 2:
         raise ValueError("Need at least 2 weak-bucket positions to run diagnostic experiments")
 
     evidence = {}
 
-    # H1 - search depth
-    shallow = run_experiment(SearchAgent, {"max_depth": 2}, weak_positions, condition="H1_depth_2",
-                              time_budget_ms=time_budget_ms, seed=seed, n_workers=4,
-                              benchmark_description="Week 6 diagnostic: weak bucket")
-    deep = run_experiment(SearchAgent, {"max_depth": 4}, weak_positions, condition="H1_depth_4",
-                           time_budget_ms=time_budget_ms, seed=seed, n_workers=4,
-                           benchmark_description="Week 6 diagnostic: weak bucket")
-    evidence["H1_search_depth"] = _paired_comparison(shallow["records"], deep["records"], "depth=2", "depth=4")
+    for hyp in hypotheses:
+        hyp_id = hyp["id"]
+        schema = hyp.get("experiment_schema")
+        
+        if not schema:
+            continue
+            
+        variable = schema["variable"]
+        control_val = schema["control"]
+        treatment_val = schema["treatment"]
+        
+        # Helper to construct agent and runner parameters dynamically
+        def build_kwargs(val):
+            agent_kwargs = {"max_depth": 3, "eval_fn": evaluate} # Defaults
+            run_kwargs = {"time_budget_ms": time_budget_ms, "seed": seed, "n_workers": 4}
+            
+            if variable == "max_depth":
+                agent_kwargs["max_depth"] = val
+            elif variable == "evaluator":
+                agent_kwargs["eval_fn"] = evaluate_material_only if val == "material" else evaluate
+            elif variable == "time_budget_ms":
+                run_kwargs["time_budget_ms"] = val
+                agent_kwargs["max_depth"] = 10 # Unlock depth to test pure time limits
+                
+            return agent_kwargs, run_kwargs
 
-    # H2 - evaluation quality (ablation)
-    material_only = run_experiment(SearchAgent, {"max_depth": 3, "eval_fn": evaluate_material_only},
-                                    weak_positions, condition="H2_eval_material_only",
-                                    time_budget_ms=time_budget_ms, seed=seed, n_workers=4,
-                                    benchmark_description="Week 6 diagnostic: weak bucket")
-    full_eval = run_experiment(SearchAgent, {"max_depth": 3, "eval_fn": evaluate},
-                                weak_positions, condition="H2_eval_full",
-                                time_budget_ms=time_budget_ms, seed=seed, n_workers=4,
-                                benchmark_description="Week 6 diagnostic: weak bucket")
-    evidence["H2_evaluation_quality"] = _paired_comparison(
-        material_only["records"], full_eval["records"], "material-only eval", "material+PST eval"
-    )
+        control_agent_kw, control_run_kw = build_kwargs(control_val)
+        treatment_agent_kw, treatment_run_kw = build_kwargs(treatment_val)
 
-    # H3 - time budget
-    short_budget = run_experiment(SearchAgent, {"max_depth": 4}, weak_positions, condition="H3_time_100ms",
-                                   time_budget_ms=100, seed=seed, n_workers=4,
-                                   benchmark_description="Week 6 diagnostic: weak bucket")
-    long_budget = run_experiment(SearchAgent, {"max_depth": 4}, weak_positions, condition="H3_time_600ms",
-                                  time_budget_ms=600, seed=seed, n_workers=4,
-                                  benchmark_description="Week 6 diagnostic: weak bucket")
-    evidence["H3_time_budget"] = _paired_comparison(short_budget["records"], long_budget["records"],
-                                                     "100ms budget", "600ms budget")
+        # Run Control
+        control_res = run_experiment(
+            SearchAgent, control_agent_kw, weak_positions, 
+            condition=f"{hyp_id}_control", 
+            benchmark_description=f"Diagnostic {hyp_id} Control", **control_run_kw
+        )
+        
+        # Run Treatment
+        treatment_res = run_experiment(
+            SearchAgent, treatment_agent_kw, weak_positions, 
+            condition=f"{hyp_id}_treatment", 
+            benchmark_description=f"Diagnostic {hyp_id} Treatment", **treatment_run_kw
+        )
+
+        label_a = f"{variable}={control_val}"
+        label_b = f"{variable}={treatment_val}"
+        
+        # Store evidence using the hypothesis ID directly as the key
+        evidence[hyp_id] = _paired_comparison(control_res["records"], treatment_res["records"], label_a, label_b)
 
     return evidence
 
 
 def rank_hypotheses(evidence: Dict) -> List[Dict]:
-    """Ranks hypotheses by improvement magnitude (the 'better' condition vs
-    the 'worse' one). Larger, more significant improvement = stronger support
-    for that hypothesis being the dominant cause."""
+    """Ranks hypotheses by improvement magnitude (the 'better' condition vs the 'worse' one)."""
     ranked = []
     for hyp_id, result in evidence.items():
         improvement = result["b_improves_on_a_by_pct"] or 0

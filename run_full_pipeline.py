@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-# Ensure all internal project modules resolve cleanly
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "engine"))
 sys.path.insert(0, str(ROOT / "experiments"))
@@ -16,21 +15,20 @@ from engine.agents import SearchAgent
 from experiments.benchmark import diagnostic_holdout_split
 from experiments.runner import run_experiment
 from analysis.profile import build_profile, tag_records
+from analysis.anomaly import detect_anomalies
 from analysis.report import format_profile_report
-from diagnosis.failure_detection import detect_primary_weakness, describe_weakness
 from diagnosis.hypotheses import generate_hypotheses
+from diagnosis.failure_detection import detect_primary_weakness, describe_weakness
+from diagnosis.llm_reasoner import build_evidence_payload, call_llm_reasoner
 from diagnosis.diagnostic_experiment import run_diagnostic_suite, rank_hypotheses
 from diagnosis.intervention import apply_intervention_and_validate
 from dashboard.report_html import build_report_html
 
 DEVIATIONS = [
-    "No network access in this sandbox: Stockfish and python-chess could not be installed "
-    "(Week 1) — the chess environment and reference evaluator were built from scratch, "
-    "verified via perft.",
-    "Trajectory data is stored as JSONL, not Parquet.",
-    "The dashboard is static HTML, not a live Streamlit app.",
     "Evaluations use curated Lichess puzzle positions with 20-pawn clipped regret against "
     "ground-truth reference moves.",
+    "Trajectory data is stored as JSONL.",
+    "Dashboard is static HTML.",
 ]
 
 
@@ -39,18 +37,17 @@ def main():
     print("GAMBIT — full pipeline run (Weeks 4-8)")
     print("=" * 60)
 
-    # --- Week 4 setup: benchmark + baseline trajectory dataset ---
+    # --- 1. Load Ground Truth Data ---
     print("\n[1/6] Loading Lichess benchmark + diagnostic/held-out split...")
     positions, _ = load_lichess_positions(path=RAW_ZST_PATH, max_positions=150, validate=True)
-
-    # Map 'phase' explicitly to resolve KeyError in benchmark.diagnostic_holdout_split
     for p in positions:
         p["phase"] = p.get("lichess_phase") or p.get("internal_phase") or "unknown"
 
     diagnostic, holdout = diagnostic_holdout_split(positions, holdout_fraction=0.3, seed=2)
     print(f"  {len(positions)} positions -> {len(diagnostic)} diagnostic / {len(holdout)} held-out")
 
-    print("\n[2/6] Running baseline agent over the diagnostic set (Week 4)...")
+    # --- 2. Baseline Evaluation ---
+    print("\n[2/6] Running baseline agent over the diagnostic set...")
     agent_name = "SearchAgent(max_depth=3)"
     baseline = run_experiment(
         SearchAgent,
@@ -66,17 +63,52 @@ def main():
     profile = build_profile(baseline["records"])
     print(format_profile_report(agent_name, profile))
 
-    # --- Week 5: failure detection + hypotheses ---
-    print("\n[3/6] Detecting primary weakness + generating hypotheses (Week 5)...")
+    # --- 2b. Anomaly Detection (Step 9) ---
+    print("\n[2b/6] Running anomaly detection...")
+    try:
+        anomalies = detect_anomalies(baseline["records"])
+        n_anomalies = len(anomalies) if isinstance(anomalies, list) else anomalies.get("n_anomalies", 0)
+        print(f"  Identified {n_anomalies} anomalous decision states.")
+    except Exception as e:
+        print(f"  Anomaly detection skipped: {e}")
+
+# --- 3. Failure Detection & Hypotheses ---
+    print("\n[3/6] Detecting primary weakness + generating candidate hypotheses...")
     weak_dim, weak_stats = detect_primary_weakness(profile)
     weakness_desc = describe_weakness(weak_dim, weak_stats)
     print(f"  {weakness_desc}")
+    
+    # 3a. Get the testable candidate hypotheses for the automated pipeline
     hyps = generate_hypotheses(weak_dim)
     for h in hyps:
         print(f"  {h['id']}: {h['name']} — {h['statement']}")
+        schema = h["experiment_schema"]
+        print(f"      -> Test Plan: {schema['variable']} (Control: {schema['control']} vs Treatment: {schema['treatment']})")
 
-    # --- Week 6: diagnostic experiments ---
-    print("\n[4/6] Running diagnostic experiments for H1/H2/H3 (Week 6)...")
+    # 3b. Use Gemini to reason about the evidence
+    print("\n  [LLM] Asking Gemini to reason about this evidence...")
+    try:
+        # We pass the stats and anomalies to Gemini so it can formulate a diagnosis
+        evidence = build_evidence_payload(
+            weak_dimension=weak_dim, 
+            weak_stats=weak_stats, 
+            hypotheses=hyps, 
+            anomaly_summary={"anomalies_detected": "See Step 2b"}
+        )
+        llm_diagnosis = call_llm_reasoner(evidence)
+        
+        print("\n" + "─"*40)
+        print(" GEMINI DIAGNOSIS")
+        print("─"*40)
+        print(f" Interpretation: {llm_diagnosis.get('interpretation')}")
+        print(f" Top Hypothesis: {llm_diagnosis.get('best_supported_hypothesis')}")
+        print(f" Next Experiment: {llm_diagnosis.get('suggested_next_experiment')}")
+        print("─"*40 + "\n")
+    except Exception as e:
+        print(f"  [LLM Skipped]: {e}")
+
+    # --- 4. Diagnostic Experiments ---
+    print("\n[4/6] Running diagnostic experiments for H1/H2/H3...")
     tagged = tag_records(baseline["records"])
     weak_records = {
         "opening": [r for r in tagged if r["game_phase"] == "opening"],
@@ -87,7 +119,6 @@ def main():
         "defensive_proxy": [r for r in tagged if r["is_defensive"]],
     }.get(weak_dim, tagged)
 
-    # Preserve reference moves and metadata so diagnostic experiments evaluate against Lichess
     weak_positions = [
         {
             "fen": r["position"],
@@ -99,10 +130,9 @@ def main():
         for r in weak_records
     ]
     if len(weak_positions) < 2:
-        print(f"  Weak bucket too small ({len(weak_positions)} positions) — falling back to full diagnostic set")
         weak_positions = diagnostic
 
-    evidence = run_diagnostic_suite(weak_positions, time_budget_ms=300, seed=100)
+    evidence = run_diagnostic_suite(weak_positions, hypotheses=hyps, time_budget_ms=300, seed=100)
     ranked = rank_hypotheses(evidence)
     for r in ranked:
         print(
@@ -111,25 +141,47 @@ def main():
             f"({r['improvement_pct']}% improvement, p={r['p_value']})"
         )
 
-    # --- Week 7: intervention + held-out validation ---
-    print("\n[5/6] Applying intervention + validating on held-out set (Week 7)...")
-    intervention_result = apply_intervention_and_validate(
-        holdout,
-        base_depth=3,
-        boosted_depth=5,
-        complexity_threshold=30,
-        time_budget_ms=300,
-        seed=500,
-    )
-    print(f"  Before (fixed depth):    mean |regret| = {intervention_result['before']['mean_abs_regret']}")
-    print(f"  After (adaptive depth):  mean |regret| = {intervention_result['after']['mean_abs_regret']}")
-    print(
-        f"  Improvement: {intervention_result['improvement_pct']}% on "
-        f"{intervention_result['n_positions']} held-out positions"
+    # --- 5. Evidence-Gated Intervention ---
+    print("\n[5/6] Evaluating diagnostic evidence for intervention gating...")
+    top_hyp = ranked[0] if ranked else None
+    has_valid_evidence = (
+        top_hyp is not None 
+        and top_hyp.get("improvement_pct", 0) > 0 
+        and top_hyp.get("p_value", 1.0) < 0.05
     )
 
-    # --- Week 8: report ---
-    print("\n[6/6] Building final report (Week 8)...")
+    if has_valid_evidence and top_hyp["hypothesis"] == "H1":
+        intervention_result = apply_intervention_and_validate(
+            holdout, base_depth=3, boosted_depth=5, complexity_threshold=30, time_budget_ms=300, seed=500
+        )
+    elif has_valid_evidence and top_hyp["hypothesis"] == "H3":
+        print(f"  Intervention confirmed: Time budget expansion based on {top_hyp['hypothesis']}.")
+        before_eval = run_experiment(SearchAgent, {"max_depth": 3}, holdout, time_budget_ms=100, reference_depth=2, seed=500)
+        after_eval = run_experiment(SearchAgent, {"max_depth": 3}, holdout, time_budget_ms=600, reference_depth=2, seed=500)
+        imp = ((before_eval["mean_regret"] - after_eval["mean_regret"]) / max(1e-6, before_eval["mean_regret"])) * 100
+        intervention_result = {
+            "status": "applied",
+            "type": "time_budget_expansion",
+            "before": {"mean_abs_regret": round(before_eval["mean_regret"], 3)},
+            "after": {"mean_abs_regret": round(after_eval["mean_regret"], 3)},
+            "improvement_pct": round(imp, 2),
+            "n_positions": len(holdout),
+        }
+        print(f"  Before (100ms): mean regret = {intervention_result['before']['mean_abs_regret']}")
+        print(f"  After (600ms):  mean regret = {intervention_result['after']['mean_abs_regret']}")
+        print(f"  Held-out Improvement: {intervention_result['improvement_pct']}%")
+    else:
+        print("  Intervention skipped: no hypothesis demonstrated statistically significant improvement.")
+        intervention_result = {
+            "status": "rejected",
+            "improvement_pct": 0.0,
+            "n_positions": len(holdout),
+            "before": {"mean_abs_regret": 0.0},
+            "after": {"mean_abs_regret": 0.0},
+        }
+
+    # --- 6. Build Final Report ---
+    print("\n[6/6] Building final report...")
     html = build_report_html(
         agent_name, profile, weak_dim, weakness_desc, ranked, intervention_result, DEVIATIONS
     )
@@ -152,9 +204,8 @@ def main():
     print(f"  Summary JSON written to {summary_path}")
 
     print("\n" + "=" * 60)
-    print("Full OBSERVE -> EVALUATE -> DIAGNOSE -> EXPERIMENT -> INTERVENE -> VALIDATE loop complete.")
+    print("Full loop complete.")
     print("=" * 60)
-    return out_path
 
 
 if __name__ == "__main__":
