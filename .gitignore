@@ -67,3 +67,5 @@ Desktop.ini
 # JetBrains (PyCharm / IntelliJ)
 .idea/
 *.iml
+
+.env
