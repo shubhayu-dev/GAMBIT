@@ -10,7 +10,7 @@ changes anywhere else in the pipeline — see the `Agent` base class contract.
 
 import random
 import time
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from environment import Board, Move, WHITE, BLACK
 from evaluation import evaluate, evaluate_material_only
@@ -19,8 +19,20 @@ from search import search_best_move
 PIECE_VALUES = {"P": 100, "N": 320, "B": 330, "R": 500, "Q": 900, "K": 0}
 
 
+def _move_to_str(move: Optional[Move]) -> str:
+    """Safe string serializer for moves across chess library representations."""
+    if move is None:
+        return ""
+    if hasattr(move, "uci"):
+        return move.uci()
+    return str(move)
+
+
 class Agent:
     """Interface every GAMBIT agent must implement (docs/06)."""
+
+    def __init__(self):
+        self.last_search_info: dict = {}
 
     def name(self) -> str:
         raise NotImplementedError
@@ -31,16 +43,34 @@ class Agent:
     def config(self) -> dict:
         return {}
 
+    def get_last_search_info(self) -> dict:
+        """Returns telemetry from the most recent move search."""
+        return getattr(self, "last_search_info", {})
+
 
 class RandomAgent(Agent):
     """Baseline: picks uniformly among legal moves. Deterministic given a seed."""
+
+    def __init__(self):
+        super().__init__()
 
     def name(self) -> str:
         return "RandomAgent"
 
     def get_move(self, board: Board, time_budget_ms: int, seed: Optional[int] = None) -> Move:
         rng = random.Random(seed)
-        return rng.choice(board.legal_moves())
+        legal = board.legal_moves()
+        move = rng.choice(legal) if legal else None
+        m_str = _move_to_str(move)
+        self.last_search_info = {
+            "depth_reached": 0,
+            "score": 0.0,
+            "nodes": 1,
+            "pv": [m_str] if m_str else [],
+            "pv_line": m_str,
+            "pv_trace": [],
+        }
+        return move
 
     def config(self) -> dict:
         return {}
@@ -66,7 +96,9 @@ class MaterialAgent(Agent):
     """
 
     def __init__(self, depth: int = 3):
+        super().__init__()
         self.depth = depth
+        self.last_search_info = {}
 
     def name(self) -> str:
         return f"MaterialAgent(depth={self.depth})"
@@ -75,39 +107,75 @@ class MaterialAgent(Agent):
         return {"depth": self.depth, "eval": "material+mobility"}
 
     def get_move(self, board: Board, time_budget_ms: int, seed: Optional[int] = None) -> Move:
-        best_move, _ = self._search(board, self.depth, float("-inf"), float("inf"))
+        best_move, best_score, pv = self._search_pv(board, self.depth, float("-inf"), float("inf"))
+        pv_str_list = [_move_to_str(m) for m in pv if m is not None]
+        self.last_search_info = {
+            "depth_reached": self.depth,
+            "score": round(best_score, 3),
+            "nodes": 0,
+            "pv": pv_str_list,
+            "pv_line": " ".join(pv_str_list),
+            "pv_trace": [],
+        }
         return best_move
 
-    def _search(self, board: Board, depth: int, alpha: float, beta: float):
+    def _search(self, board: Board, depth: int, alpha: float, beta: float) -> Tuple[Optional[Move], float]:
+        """Maintains 2-tuple return convention for backward compatibility."""
+        move, score, _pv = self._search_pv(board, depth, alpha, beta)
+        return move, score
+
+    def _search_pv(
+        self, board: Board, depth: int, alpha: float, beta: float
+    ) -> Tuple[Optional[Move], float, List[Move]]:
         if depth == 0 or board.is_terminal():
             if board.is_checkmate():
-                return None, (-99999 if board.turn == WHITE else 99999)
-            return None, material_score(board)
+                score = -99999 if board.turn == WHITE else 99999
+                return None, score, []
+            return None, material_score(board), []
 
         legal = board.legal_moves()
+        if not legal:
+            return None, material_score(board), []
+
         maximizing = board.turn == WHITE
         best_move = legal[0]
+        best_pv: List[Move] = [best_move]
         best_score = float("-inf") if maximizing else float("inf")
 
         for move in legal:
-            _, score = self._search(board.apply_move(move), depth - 1, alpha, beta)
+            _, score, child_pv = self._search_pv(board.apply_move(move), depth - 1, alpha, beta)
             if maximizing:
                 if score > best_score:
                     best_score, best_move = score, move
+                    best_pv = [move] + child_pv
                 alpha = max(alpha, best_score)
             else:
                 if score < best_score:
                     best_score, best_move = score, move
+                    best_pv = [move] + child_pv
                 beta = min(beta, best_score)
             if beta <= alpha:
                 break
-        return best_move, best_score
+        return best_move, best_score, best_pv
 
 
 def evaluate_position(board: Board, depth: int = 3) -> float:
     """Reference evaluation used to compute decision regret (docs/08_metrics_spec.md)."""
     _, score = MaterialAgent(depth=depth)._search(board, depth, float("-inf"), float("inf"))
     return score
+
+
+def evaluate_position_details(board: Board, depth: int = 3) -> dict:
+    """Reference evaluation returning score, best_move, and PV continuation line."""
+    agent = MaterialAgent(depth=depth)
+    best_move, score, pv = agent._search_pv(board, depth, float("-inf"), float("inf"))
+    pv_str_list = [_move_to_str(m) for m in pv if m is not None]
+    return {
+        "best_move": _move_to_str(best_move) if best_move else None,
+        "score": round(score, 3),
+        "pv": pv_str_list,
+        "pv_line": " ".join(pv_str_list),
+    }
 
 
 class SearchAgent(Agent):
@@ -121,6 +189,7 @@ class SearchAgent(Agent):
     """
 
     def __init__(self, max_depth: int = 4, eval_fn=None):
+        super().__init__()
         self.max_depth = max_depth
         self.eval_fn = eval_fn if eval_fn is not None else evaluate
         self.last_search_info = {}
@@ -151,16 +220,21 @@ class AdaptiveSearchAgent(Agent):
     clearly separated -- this class only implements the mechanism.
     """
 
-    def __init__(self, base_depth: int = 3, boosted_depth: int = 5,
-                 complexity_threshold: int = 30, eval_fn=None):
+    def __init__(
+        self, base_depth: int = 3, boosted_depth: int = 5, complexity_threshold: int = 30, eval_fn=None
+    ):
+        super().__init__()
         self.base_depth = base_depth
         self.boosted_depth = boosted_depth
         self.complexity_threshold = complexity_threshold
         self.eval_fn = eval_fn if eval_fn is not None else evaluate
+        self.last_search_info = {}
 
     def name(self) -> str:
-        return (f"AdaptiveSearchAgent(base={self.base_depth}, boosted={self.boosted_depth}, "
-                f"threshold={self.complexity_threshold})")
+        return (
+            f"AdaptiveSearchAgent(base={self.base_depth}, boosted={self.boosted_depth}, "
+            f"threshold={self.complexity_threshold})"
+        )
 
     def config(self) -> dict:
         return {
@@ -172,6 +246,10 @@ class AdaptiveSearchAgent(Agent):
 
     def get_move(self, board: Board, time_budget_ms: int, seed: Optional[int] = None) -> Move:
         complexity = len(board.legal_moves())
-        depth = self.boosted_depth if complexity >= self.complexity_threshold else self.base_depth
-        move, _info = search_best_move(board, depth, time_budget_ms, self.eval_fn)
+        is_boosted = complexity >= self.complexity_threshold
+        depth = self.boosted_depth if is_boosted else self.base_depth
+        move, info = search_best_move(board, depth, time_budget_ms, self.eval_fn)
+        info["adaptive_boosted"] = is_boosted
+        info["branching_complexity"] = complexity
+        self.last_search_info = info
         return move

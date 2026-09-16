@@ -10,6 +10,8 @@ sys.path.insert(0, str(ROOT / "analysis"))
 sys.path.insert(0, str(ROOT / "diagnosis"))
 sys.path.insert(0, str(ROOT / "dashboard"))
 
+from engine.neural_agent import NeuralAgent
+from analysis.disagreement import compute_disagreement, disagreement_regret_correlation
 from experiments.lichess_data import load_lichess_positions, RAW_ZST_PATH
 from engine.agents import SearchAgent
 from experiments.benchmark import diagnostic_holdout_split
@@ -65,45 +67,97 @@ def main():
 
     # --- 2b. Anomaly Detection (Step 9) ---
     print("\n[2b/6] Running anomaly detection...")
+    anomaly_summary = None
     try:
         anomalies = detect_anomalies(baseline["records"])
         n_anomalies = len(anomalies) if isinstance(anomalies, list) else anomalies.get("n_anomalies", 0)
+        anomaly_summary = {"n_anomalies": n_anomalies}
         print(f"  Identified {n_anomalies} anomalous decision states.")
     except Exception as e:
         print(f"  Anomaly detection skipped: {e}")
 
-# --- 3. Failure Detection & Hypotheses ---
+    # --- Step 10: Classical vs. Neural Disagreement ---
+    print("\n[2c/6] Computing Classical vs Neural Evaluation Disagreement...")
+    try:
+        n_agent = NeuralAgent()
+        enriched = compute_disagreement(baseline["records"], n_agent)
+        disagreement_stats = disagreement_regret_correlation(enriched)
+        
+        corr = disagreement_stats.get('correlation')
+        pval = disagreement_stats.get('p_value')
+        sig = "Significant" if pval is not None and pval < 0.05 else "Not significant"
+        print(f"  Mean Disagreement: {disagreement_stats['mean_disagreement']} pawns")
+        print(f"  Correlation with Regret: {corr} (p={pval}) -> {sig}")
+    except Exception as e:
+        print(f"  Disagreement analysis skipped: {e}")
+        disagreement_stats = None
+
+    # --- 3. Failure Detection & Hypotheses ---
     print("\n[3/6] Detecting primary weakness + generating candidate hypotheses...")
     weak_dim, weak_stats = detect_primary_weakness(profile)
     weakness_desc = describe_weakness(weak_dim, weak_stats)
     print(f"  {weakness_desc}")
     
-    # 3a. Get the testable candidate hypotheses for the automated pipeline
+    # 3a. Candidate hypotheses
     hyps = generate_hypotheses(weak_dim)
     for h in hyps:
         print(f"  {h['id']}: {h['name']} — {h['statement']}")
         schema = h["experiment_schema"]
         print(f"      -> Test Plan: {schema['variable']} (Control: {schema['control']} vs Treatment: {schema['treatment']})")
 
-    # 3b. Use Gemini to reason about the evidence
-    print("\n  [LLM] Asking Gemini to reason about this evidence...")
+    # 3b. Extract glass-box blunder case studies for the LLM
+    blunders = sorted(
+        [r for r in baseline["records"] if r.get("regret", 0.0) > 0 and not r.get("decision_match", False)],
+        key=lambda r: r.get("regret", 0.0),
+        reverse=True
+    )
+    
+    # MICRO-BATCHING: Only send the top 2 worst blunders to the LLM
+    case_studies = [
+        {
+            "position": b.get("position"),
+            "puzzle_id": b.get("puzzle_id"),
+            "chosen_move": b.get("chosen_move"),
+            "reference_move": b.get("reference_move"),
+            "regret": b.get("regret"),
+            "agent_depth": b.get("agent_depth_reached"),
+            "agent_pv_line": b.get("agent_pv_line"),
+            "agent_pv_trace": b.get("agent_pv_trace", []),
+            "reference_pv_line": b.get("reference_pv_line", ""),
+        }
+        for b in blunders[:2]
+    ]
+
+    # 3c. Gemini LLM Reasoning
+    print("\n  [LLM] Asking Gemini to reason with glass-box telemetry...")
+    llm_diagnosis = {}
     try:
-        # We pass the stats and anomalies to Gemini so it can formulate a diagnosis
         evidence = build_evidence_payload(
             weak_dimension=weak_dim, 
             weak_stats=weak_stats, 
-            hypotheses=hyps, 
-            anomaly_summary={"anomalies_detected": "See Step 2b"}
+            hypotheses=hyps,
+            disagreement_stats=disagreement_stats,
+            anomaly_summary=anomaly_summary,
+            case_studies=case_studies
         )
         llm_diagnosis = call_llm_reasoner(evidence)
         
-        print("\n" + "─"*40)
-        print(" GEMINI DIAGNOSIS")
-        print("─"*40)
+        print("\n" + "─" * 50)
+        print(" GEMINI GLASS-BOX DIAGNOSIS")
+        print("─" * 50)
         print(f" Interpretation: {llm_diagnosis.get('interpretation')}")
         print(f" Top Hypothesis: {llm_diagnosis.get('best_supported_hypothesis')}")
         print(f" Next Experiment: {llm_diagnosis.get('suggested_next_experiment')}")
-        print("─"*40 + "\n")
+        
+        case_diagnoses = llm_diagnosis.get("case_study_analysis", [])
+        if case_diagnoses:
+            print("\n Blunder Case Studies (Move-by-Move Refutation):")
+            for cs in case_diagnoses:
+                print(f"   • Position: {cs.get('position')}")
+                if "divergence_analysis" in cs:
+                    print(f"     Divergence: {cs.get('divergence_analysis')}")
+                print(f"     Diagnosis:  {cs.get('diagnosis')}")
+        print("─" * 50 + "\n")
     except Exception as e:
         print(f"  [LLM Skipped]: {e}")
 
@@ -183,7 +237,7 @@ def main():
     # --- 6. Build Final Report ---
     print("\n[6/6] Building final report...")
     html = build_report_html(
-        agent_name, profile, weak_dim, weakness_desc, ranked, intervention_result, DEVIATIONS
+        agent_name, profile, weak_dim, weakness_desc, ranked, intervention_result, DEVIATIONS, llm_diagnosis
     )
     out_path = ROOT / "data" / "gambit_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -198,6 +252,7 @@ def main():
         "profile": profile,
         "weak_dimension": weak_dim,
         "hypotheses_ranked": ranked,
+        "llm_diagnosis": llm_diagnosis,
         "intervention": {k: v for k, v in intervention_result.items() if not k.endswith("_records")},
     }
     summary_path.write_text(json.dumps(summary, indent=2))

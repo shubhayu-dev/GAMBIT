@@ -78,8 +78,8 @@ def main():
         print(f"  {name:24s}: MAE={mean_absolute_error(y_test_arr, pred):.3f}  "
               f"RMSE={mean_squared_error(y_test_arr, pred)**0.5:.3f}")
 
-    save_model(model, Path(__file__).resolve().parent.parent / "data" / "neural_value_model_gamesplit.pkl")
-    print(f"\nModel saved to data/neural_value_model_gamesplit.pkl")
+    save_model(model, Path(__file__).resolve().parent.parent / "data" / "neural_value_model.pkl")
+    print(f"\nModel saved to data/neural_value_model.pkl (Main model updated)")
 
 
 if __name__ == "__main__":

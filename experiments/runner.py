@@ -1,3 +1,11 @@
+"""
+Experiment runner for GAMBIT (docs/07_experiment_runner.md).
+
+Executes agent evaluation across benchmark positions, capturing move telemetry,
+regret calculations, and full Principal Variation (PV) traces for glass-box
+diagnostic analysis.
+"""
+
 import sys
 import time
 import uuid
@@ -7,12 +15,22 @@ from typing import Dict, List, Optional, Type
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "engine"))
 from engine.environment import Board  # noqa: E402
-from engine.agents import Agent, MaterialAgent, evaluate_position  # noqa: E402
+from engine.agents import (  # noqa: E402
+    Agent, MaterialAgent, evaluate_position, evaluate_position_details,
+)
 
 from experiments.data_store import (  # noqa: E402
     DATA_DIR, init_db, register_agent, register_benchmark, register_experiment,
     register_run, write_trajectory_jsonl,
 )
+
+
+def _move_to_uci(move) -> Optional[str]:
+    if move is None:
+        return None
+    if hasattr(move, "uci"):
+        return move.uci()
+    return str(move)
 
 
 def _evaluate_one_position(args) -> Dict:
@@ -21,7 +39,8 @@ def _evaluate_one_position(args) -> Dict:
     board = Board(fen)
     agent = agent_class(**agent_kwargs)
 
-    eval_before = evaluate_position(board, depth=reference_depth)
+    ref_details_before = evaluate_position_details(board, depth=reference_depth)
+    eval_before = ref_details_before["score"]
     
     t0 = time.time()
     chosen_move = agent.get_move(board, time_budget_ms=time_budget_ms, seed=seed)
@@ -30,18 +49,23 @@ def _evaluate_one_position(args) -> Dict:
 
     # GROUND TRUTH OVERRIDE: Use Lichess puzzle solution if available, 
     # otherwise fallback to internal MaterialAgent baseline.
+    reference_pv_line = ""
     if "reference_move_lichess" in pos:
         uci_str = pos["reference_move_lichess"]
-        reference_move = next((m for m in board.legal_moves() if m.uci() == uci_str), None)
+        reference_move = next((m for m in board.legal_moves() if _move_to_uci(m) == uci_str), None)
+        reference_pv_line = pos.get("solution_line", uci_str)
     else:
-        reference_move, _ = MaterialAgent(depth=reference_depth)._search(
-            board, reference_depth, float("-inf"), float("inf")
-        )
+        reference_move_str = ref_details_before.get("best_move")
+        reference_move = next((m for m in board.legal_moves() if _move_to_uci(m) == reference_move_str), None)
+        reference_pv_line = ref_details_before.get("pv_line", "")
 
-    next_board = board.apply_move(chosen_move)
+    chosen_uci = _move_to_uci(chosen_move)
+    reference_uci = _move_to_uci(reference_move)
+
+    next_board = board.apply_move(chosen_move) if chosen_move else board
     eval_after = evaluate_position(next_board, depth=reference_depth)
 
-    if reference_move is not None and reference_move.uci() != chosen_move.uci():
+    if reference_move is not None and reference_uci != chosen_uci:
         reference_board = board.apply_move(reference_move)
         eval_after_reference = evaluate_position(reference_board, depth=reference_depth)
     else:
@@ -61,20 +85,31 @@ def _evaluate_one_position(args) -> Dict:
     return {
         "position": fen,
         "agent": agent.name(),
-        "chosen_move": chosen_move.uci() if chosen_move else None,
-        "reference_move": reference_move.uci() if reference_move else None,
+        "chosen_move": chosen_uci,
+        "reference_move": reference_uci,
+        "decision_match": (chosen_uci == reference_uci) if reference_uci and chosen_uci else False,
         "evaluation_before": round(eval_before, 3),
         "evaluation_after": round(eval_after, 3),
-        "regret": max(0.0, round(regret, 3)), # Enforce non-negative regret mathematically
+        "regret": max(0.0, round(regret, 3)),
         "single_move_eval_delta": round(single_move_eval_delta, 3),
         "search_depth": reference_depth,
+        
+        # Glass-box agent telemetry
         "agent_depth_reached": search_info.get("depth_reached"),
         "agent_nodes_searched": search_info.get("nodes"),
+        "agent_score": search_info.get("score"),
+        "agent_pv": search_info.get("pv", []),
+        "agent_pv_line": search_info.get("pv_line", ""),
+        "agent_pv_trace": search_info.get("pv_trace", []),
+        
+        # Ground truth continuation
+        "reference_pv_line": reference_pv_line,
+        
         "time_used": round(time_used, 4),
-        "game_phase": board.game_phase(),                 # Internal heuristic (Option C)
-        "lichess_phase": pos.get("lichess_phase"),        # Ground truth tag (Option C)
+        "game_phase": board.game_phase(),
+        "lichess_phase": pos.get("lichess_phase"),
         "puzzle_id": pos.get("puzzle_id"),
-        "game_id": pos.get("game_id"),                    # Audit Item 12.3 fix
+        "game_id": pos.get("game_id"),
         "rating": pos.get("rating"),
         "condition": condition,
     }
@@ -85,7 +120,6 @@ def run_experiment(agent_class: Type[Agent], agent_kwargs: Optional[dict], posit
                     seed: int = 0, n_workers: int = 4, benchmark_description: str = "self-play sample") -> Dict:
     
     agent_kwargs = agent_kwargs or {}
-    # Pass the entire `pos` dictionary into args to retain metadata
     tasks = [
         (agent_class, agent_kwargs, pos, time_budget_ms, reference_depth, seed + i, condition)
         for i, pos in enumerate(positions)
@@ -114,5 +148,10 @@ def run_experiment(agent_class: Type[Agent], agent_kwargs: Optional[dict], posit
     register_run(conn, run_id, experiment_id, len(records), mean_regret, str(trajectory_path))
     conn.close()
 
-    return {"records": records, "mean_regret": mean_regret, "trajectory_path": trajectory_path,
-            "experiment_id": experiment_id, "run_id": run_id}
+    return {
+        "records": records,
+        "mean_regret": mean_regret,
+        "trajectory_path": trajectory_path,
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+    }

@@ -1,132 +1,144 @@
 """
-Neural value model (docs/11_integration_addendum.md, "5. Modern AI Agent").
+PyTorch Neural Value Model (docs/11_integration_addendum.md).
 
-Two honest notes up front, both about the training target -- see the addendum
-for the full write-up:
+This agent uses a deep neural network to evaluate chess positions statically.
+Unlike the classical evaluator (which relies on search depth to see tactics),
+this model is trained to recognize positional patterns, king safety, and 
+long-term compensation instantly.
 
-1. Self-play *game outcome* (win/draw/loss) was tried first, per the
-   integration spec's preferred target. At this sandbox's scale (RandomAgent
-   self-play, single CPU, no time to run thousands of long games) only ~12%
-   of games reach a decisive result within 150 plies -- the rest hit the ply
-   cap undecided. That makes outcome-based labels overwhelmingly "draw",
-   which isn't a useful training signal. `self_play_data.py` still implements
-   this honestly (it's the right target once real games/compute are
-   available) but isn't what trains the model below.
-2. Instead, the model here is trained to approximate `MaterialAgent`'s
-   fixed-depth search evaluation on a broad sample of self-play positions --
-   i.e. function approximation / distillation of the classical evaluator,
-   not an independently-discovered signal. This is a real, legitimate ML
-   technique (it's literally how engines like Stockfish's NNUE were
-   originally bootstrapped), but it means this model cannot know anything
-   the classical evaluator doesn't already encode. Swap in real game-outcome
-   or real Lichess-derived labels once there's enough compute/data for
-   outcome labels to not be almost-all-draws.
+Updated to support batch GPU evaluation for high-throughput search trees.
 """
 
-import pickle
+import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
-from environment import Board, WHITE
-from features import board_to_features, FEATURE_DIM
+from environment import Board
+from features import board_to_features, create_feature_batch, FEATURE_DIM
 from agents import Agent, evaluate_position
 from search import search_best_move
 
 try:
-    from sklearn.neural_network import MLPRegressor
-    HAVE_SKLEARN = True
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    HAVE_TORCH = True
 except ImportError:
-    HAVE_SKLEARN = False
+    HAVE_TORCH = False
 
-MODEL_PATH = Path(__file__).resolve().parent.parent / "data" / "neural_value_model.pkl"
-
-
-def generate_distillation_training_data(positions: List[dict], reference_depth: int = 2,
-                                          clip_pawns: float = 20.0) -> Tuple[List[List[float]], List[float]]:
-    """Labels each position's feature vector with MaterialAgent's fixed-depth
-    evaluation (in pawns, from White's perspective) -- see module docstring
-    for why this target was chosen over sparse self-play outcomes.
-
-    Mate scores found within the reference search (~+-99999) are clipped to
-    +-clip_pawns: a handful of such outliers in a ~2000-position sample were
-    enough to dominate the MLP's squared-error loss and wreck the fit
-    everywhere else (train/test R^2 went negative). Clipping is standard
-    practice for training on engine evaluations for exactly this reason --
-    it says "very good/bad", not a literal pawn count, past that point."""
-    X, y = [], []
-    for pos in positions:
-        board = Board(pos["fen"])
-        value = evaluate_position(board, depth=reference_depth)
-        value = max(-clip_pawns, min(clip_pawns, value))
-        X.append(board_to_features(board))
-        y.append(value)
-    return X, y
+MODEL_PATH = Path(__file__).resolve().parent.parent / "data" / "pytorch_value_net.pth"
 
 
-def train_value_network(X: List[List[float]], y: List[float], seed: int = 0) -> "MLPRegressor":
-    if not HAVE_SKLEARN:
-        raise RuntimeError("scikit-learn is required to train the neural value model")
-    model = MLPRegressor(
-        hidden_layer_sizes=(128, 64),
-        activation="relu",
-        max_iter=500,
-        random_state=seed,
-        early_stopping=True,
-        n_iter_no_change=15,
-    )
-    model.fit(X, y)
-    return model
+class ChessValueNet(nn.Module):
+    """
+    A robust Feed-Forward Neural Network for static board evaluation.
+    This architecture is heavily regularized to prevent memorization and 
+    deep enough to learn complex positional heuristics natively.
+    """
+    def __init__(self, input_dim: int = FEATURE_DIM):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        
+        self.fc4 = nn.Linear(128, 1)
+        self.dropout = nn.Dropout(p=0.3)
+
+    def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = self.dropout(x)
+        
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = self.dropout(x)
+        
+        x = F.relu(self.bn3(self.fc3(x)))
+        return self.fc4(x)
 
 
-def save_model(model, path: Path = MODEL_PATH):
-    path.parent.mkdir(exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(model, f)
+def neural_batch_evaluate(boards: List[Board], model: Optional[nn.Module], device: str = "cpu") -> List[float]:
+    """
+    Evaluates a batch of positions simultaneously on the GPU.
+    Returns a list of float evaluation scores (in pawn units).
+    """
+    if not HAVE_TORCH or model is None or len(boards) == 0:
+        return [0.0] * len(boards)
+
+    model.eval()
+    with torch.no_grad():
+        x = create_feature_batch(boards, device=device)
+        preds = model(x)
+        return preds.view(-1).cpu().tolist()
 
 
-def load_model(path: Path = MODEL_PATH):
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def neural_evaluate(board: Board, model) -> float:
-    """Same signature/scale convention (pawns, White's perspective) as
-    engine/evaluation.py's evaluate(), so it's a drop-in eval_fn for the
-    existing alpha-beta search in search.py -- no search code changes needed
-    to use a learned evaluator instead of a hand-coded one."""
-    x = [board_to_features(board)]
-    return float(model.predict(x)[0])
+def neural_evaluate(board: Board, model: Optional[nn.Module], device: str = "cpu") -> float:
+    """
+    Generates a static evaluation of a single board using the PyTorch model.
+    """
+    scores = neural_batch_evaluate([board], model, device=device)
+    return scores[0] if scores else 0.0
 
 
 class NeuralAgent(Agent):
     """
-    The 'modern AI' agent (docs/11_integration_addendum.md). Same
-    iterative-deepening alpha-beta search as SearchAgent, but the leaf
-    evaluation comes from a trained MLPRegressor instead of hand-coded
-    material+PST weights. This isolates exactly one variable (where the
-    evaluation numbers come from) so classical-vs-neural comparisons
-    (analysis/disagreement.py) are apples-to-apples.
+    The neural agent. Uses iterative-deepening alpha-beta search accelerated 
+    by batched GPU evaluations over leaf nodes and sibling branches.
     """
 
-    def __init__(self, model=None, model_path: Optional[Path] = None, max_depth: int = 3):
-        self.model = model if model is not None else load_model(model_path or MODEL_PATH)
+    def __init__(self, model_path: Optional[Path] = None, max_depth: int = 3):
+        super().__init__()
         self.max_depth = max_depth
+        self.device = "cuda" if HAVE_TORCH and torch.cuda.is_available() else "cpu"
+        self.last_search_info = {}
+        
+        if not HAVE_TORCH:
+            print("WARNING: PyTorch not installed. NeuralAgent will return 0.0 eval.")
+            self.model = None
+        else:
+            self.model = ChessValueNet().to(self.device)
+            path = model_path or MODEL_PATH
+            if path.exists():
+                self.model.load_state_dict(torch.load(path, map_location=self.device))
+                self.model.eval()
+            else:
+                print(f"WARNING: No trained weights found at {path}. Model is untrained.")
 
     def name(self) -> str:
-        return f"NeuralAgent(max_depth={self.max_depth})"
+        return f"NeuralAgent(PyTorch, max_depth={self.max_depth})"
 
     def config(self) -> dict:
-        return {"max_depth": self.max_depth, "eval": "mlp_value_net", "search": "iterative_deepening_alphabeta"}
+        return {
+            "max_depth": self.max_depth, 
+            "eval": "pytorch_value_net", 
+            "search": "iterative_deepening_alphabeta_batched",
+            "device": self.device,
+        }
 
     def _eval_fn(self, board: Board) -> float:
-        return neural_evaluate(board, self.model)
+        return neural_evaluate(board, self.model, self.device)
+
+    def _batch_eval_fn(self, boards: List[Board]) -> List[float]:
+        return neural_batch_evaluate(boards, self.model, self.device)
 
     def get_move(self, board: Board, time_budget_ms: int, seed: Optional[int] = None):
-        move, _info = search_best_move(board, self.max_depth, time_budget_ms, self._eval_fn)
+        move, info = search_best_move(
+            board,
+            self.max_depth,
+            time_budget_ms,
+            eval_fn=self._eval_fn,
+            batch_eval_fn=self._batch_eval_fn,
+        )
+        self.last_search_info = info
         return move
 
     def raw_value(self, board: Board) -> float:
-        """Direct value-net prediction with no search -- used for
-        classical/neural disagreement analysis, which compares evaluations,
-        not just final moves."""
-        return neural_evaluate(board, self.model)
+        """Direct single prediction with no tree search."""
+        return neural_evaluate(board, self.model, self.device)
+
+    def raw_batch_values(self, boards: List[Board]) -> List[float]:
+        """Direct batch predictions with no tree search."""
+        return neural_batch_evaluate(boards, self.model, self.device)

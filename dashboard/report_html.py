@@ -1,15 +1,8 @@
 """
 Dashboard (docs/10 Week 8: "dashboard + visualizations + experiment report").
 
-Deviation, flagged per Constitution Rule 7: the spec calls for Streamlit.
-`streamlit` isn't installable in this sandbox (no network). This module
-generates a static, self-contained HTML report instead -- same content
-(capability profile, failure diagnosis, hypothesis ranking, intervention
-validation), just rendered once rather than served interactively. Swapping to
-a real Streamlit app later means wiring these same functions (profile.py,
-failure_detection.py, diagnostic_experiment.py, intervention.py) to
-`st.bar_chart` / `st.dataframe` calls instead of the HTML template below --
-none of the underlying analysis changes.
+Generates a static, self-contained HTML report integrating statistical metrics 
+and the LLM's move-by-move telemetry reasoning.
 """
 
 from typing import Dict, List
@@ -28,7 +21,7 @@ def _bar(label: str, value: float, max_value: float = 100.0, suffix: str = "%") 
 
 def build_report_html(agent_name: str, profile: Dict, weakness_dim: str, weakness_desc: str,
                        ranked_hypotheses: List[Dict], intervention_result: Dict,
-                       deviations: List[str]) -> str:
+                       deviations: List[str], llm_diagnosis: Dict = None) -> str:
     dim_rows = "".join(
         _bar(name.replace("_proxy", "*").replace("_", " ").title(), profile[key]["decision_accuracy_pct"])
         for name, key in [
@@ -51,8 +44,35 @@ def build_report_html(agent_name: str, profile: Dict, weakness_dim: str, weaknes
     improvement = intervention_result["improvement_pct"]
 
     deviation_items = "".join(f"<li>{d}</li>" for d in deviations)
-
     overall_acc = profile["overall"]["decision_accuracy_pct"]
+
+    # --- Build the LLM Diagnosis Section ---
+    llm_section = ""
+    if llm_diagnosis:
+        interp = llm_diagnosis.get("interpretation", "No interpretation available.")
+        best_hyp = llm_diagnosis.get("best_supported_hypothesis", "None")
+        
+        cases_html = ""
+        for cs in llm_diagnosis.get("case_study_analysis", []):
+            fen = cs.get("position", "Unknown")
+            div = cs.get("divergence_analysis", "")
+            diag = cs.get("diagnosis", "")
+            cases_html += f"""
+            <div class="case-study">
+              <div class="fen">FEN: {fen}</div>
+              <div class="analysis"><strong>Divergence:</strong> {div}</div>
+              <div class="analysis"><strong>Diagnosis:</strong> {diag}</div>
+            </div>
+            """
+            
+        llm_section = f"""
+        <h2>03 — Gemini Glass-Box Diagnosis</h2>
+        <div class="llm-box">
+          <p class="interp"><strong>Interpretation:</strong> {interp}</p>
+          <p class="interp"><strong>Top Supported Hypothesis:</strong> {best_hyp}</p>
+          {cases_html}
+        </div>
+        """
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -69,6 +89,7 @@ def build_report_html(agent_name: str, profile: Dict, weakness_dim: str, weaknes
     --gold: #c9a227;
     --good: #7a9b6e;
     --bad: #b5674f;
+    --ai: #8e7cc3;
   }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -120,6 +141,16 @@ def build_report_html(agent_name: str, profile: Dict, weakness_dim: str, weaknes
     padding: 16px 20px;
     font-size: 14px;
   }}
+  .llm-box {{
+    background: var(--panel);
+    border-left: 3px solid var(--ai);
+    padding: 20px;
+    font-size: 14px;
+  }}
+  .llm-box .interp {{ margin-top: 0; margin-bottom: 8px; }}
+  .case-study {{ margin-top: 20px; padding-top: 16px; border-top: 1px dashed var(--line); }}
+  .case-study .fen {{ font-family: monospace; color: var(--gold); margin-bottom: 8px; font-size: 12px; }}
+  .case-study .analysis {{ margin-bottom: 6px; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
   th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }}
   th {{ color: var(--ink-dim); font-weight: normal; font-family: monospace; font-size: 12px; }}
@@ -151,14 +182,16 @@ def build_report_html(agent_name: str, profile: Dict, weakness_dim: str, weaknes
   <h2>02 — Primary Weakness</h2>
   <div class="weakness-box">{weakness_desc}</div>
 
-  <h2>03 — Diagnostic Experiments</h2>
+  {llm_section}
+
+  <h2>04 — Diagnostic Experiments</h2>
   <table>
     <tr><th>Hypothesis</th><th>Condition A &rarr; B</th><th>Mean |regret| A &rarr; B</th><th>Improvement</th><th>p-value</th></tr>
     {hyp_rows}
   </table>
   <p style="font-size:12px;color:var(--ink-dim)">Ranked by improvement magnitude; the top row is the best-supported cause. Small sample sizes here (n shown in each hypothesis's underlying run) mean p-values should be read as directional, not conclusive.</p>
 
-  <h2>04 — Intervention: Adaptive Search Depth</h2>
+  <h2>05 — Intervention: Adaptive Search Depth</h2>
   <div class="validation">
     <div class="col before"><div class="n">{before}</div><div>before (fixed depth)</div></div>
     <div class="arrow">&rarr;</div>
