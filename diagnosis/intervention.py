@@ -1,61 +1,118 @@
 """
-Intervention + held-out validation (docs/10 Week 7,
-docs/09_experiment_protocol.md step 7: "validate on held-out set, once").
-
-Implements the doc's own worked example: adaptive search depth based on
-position complexity, via AdaptiveSearchAgent (engine/agents.py). The
-diagnostic-set experiments in Week 6 inform *which* hypothesis to act on;
-this module applies the resulting intervention and checks it on positions
-that were never touched during diagnosis.
+Validation layer for GAMBIT.
+Extracts the dominant empirical fix from the proven ledger and tests it 
+on a held-out dataset to verify generalization and prevent overfitting.
 """
 
-import sys
-from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Tuple
+from collections import Counter
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "engine"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments"))
-from agents import SearchAgent, AdaptiveSearchAgent  # noqa: E402
-from runner import run_experiment  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
-from metrics import mean_abs_regret  # noqa: E402
+# Reuse the universal agent query function from the active diagnostic loop
+from diagnosis.diagnostic_experiment import _query_agent
 
 
-def apply_intervention_and_validate(holdout_positions: List[Dict], base_depth: int = 3,
-                                     boosted_depth: int = 5, complexity_threshold: int = 30,
-                                     time_budget_ms: int = 300, seed: int = 500) -> Dict:
+def extract_dominant_fix(proven_ledger: List[Dict]) -> Tuple[str, Dict[str, Any]]:
     """
-    Runs the baseline agent (fixed depth) and the adaptive-depth intervention
-    on the SAME held-out positions, once, and reports before/after. No
-    re-tuning against these results -- if it doesn't generalize, that's a
-    valid, reportable finding (docs/09_experiment_protocol.md step 7).
+    Scans the proven ledger to find the most frequently successful parameter tweak.
+    Returns a description of the fix and the exact configuration kwargs to run it.
     """
-    if len(holdout_positions) < 1:
-        raise ValueError("Need at least 1 held-out position to validate")
+    successful_tests = []
+    
+    for record in proven_ledger:
+        for log in record.get("investigation_log", []):
+            if log.get("success"):
+                successful_tests.append(log.get("test"))
+                break  # Only count the first successful fix per position
 
-    before = run_experiment(
-        SearchAgent, {"max_depth": base_depth}, holdout_positions,
-        condition="held_out_before", time_budget_ms=time_budget_ms, seed=seed, n_workers=4,
-        benchmark_description="Week 7 held-out validation",
-    )
-    after = run_experiment(
-        AdaptiveSearchAgent,
-        {"base_depth": base_depth, "boosted_depth": boosted_depth, "complexity_threshold": complexity_threshold},
-        holdout_positions, condition="held_out_after", time_budget_ms=time_budget_ms, seed=seed, n_workers=4,
-        benchmark_description="Week 7 held-out validation",
-    )
+    if not successful_tests:
+        return "No generalized fix found", {}
 
-    mean_before = mean_abs_regret(before["records"])
-    mean_after = mean_abs_regret(after["records"])
-    improvement_pct = (round(100.0 * (1 - mean_after / mean_before), 1)
-                        if mean_before and mean_before > 0 else None)
+    # Find the most common successful parameter injection
+    dominant_test_string = Counter(successful_tests).most_common(1)[0][0]
+    
+    # Parse the string back into kwargs (e.g., "depth=6" -> {"max_depth": 6})
+    intervention_kwargs = {}
+    if "=" in dominant_test_string:
+        param, val_str = dominant_test_string.split("=")
+        
+        # Type casting inference
+        try:
+            val = int(val_str.replace("ms", ""))
+        except ValueError:
+            try:
+                val = float(val_str)
+            except ValueError:
+                val = val_str
+
+        # Map to internal variables
+        if param == "depth":
+            intervention_kwargs["max_depth"] = val
+        elif param == "time":
+            intervention_kwargs["time_budget_ms"] = val
+        else:
+            intervention_kwargs[param] = val
+
+    return dominant_test_string, intervention_kwargs
+
+
+def evaluate_intervention(
+    agent_target: Any, 
+    held_out_positions: List[Dict[str, Any]], 
+    baseline_kwargs: Dict[str, Any],
+    intervention_kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Runs the dominant fix on a blind, held-out dataset.
+    Compares baseline performance against the intervened performance.
+    """
+    baseline_regret_sum = 0.0
+    intervention_regret_sum = 0.0
+    baseline_matches = 0
+    intervention_matches = 0
+    total = len(held_out_positions)
+
+    if total == 0:
+        return {}
+
+    for pos in held_out_positions:
+        fen = pos["position"]
+        ref_move = pos["reference_move"]
+        
+        # Calculate baseline if it wasn't pre-computed in the dataset
+        if "regret" in pos and pos.get("chosen_move") is not None:
+            baseline_regret = pos["regret"]
+            baseline_move = pos["chosen_move"]
+        else:
+            baseline_move = _query_agent(agent_target, fen, baseline_kwargs)
+            # In a full system, you would query your oracle/evaluator here for exact regret.
+            # For this validation, we use a binary match proxy if the oracle isn't live.
+            baseline_regret = 0.0 if baseline_move == ref_move else 1.0 
+
+        # Run the intervened agent
+        treated_move = _query_agent(agent_target, fen, intervention_kwargs)
+        treated_regret = 0.0 if treated_move == ref_move else 1.0
+
+        baseline_regret_sum += baseline_regret
+        intervention_regret_sum += treated_regret
+        
+        if baseline_move == ref_move:
+            baseline_matches += 1
+        if treated_move == ref_move:
+            intervention_matches += 1
+
+    mean_baseline_regret = baseline_regret_sum / total
+    mean_intervention_regret = intervention_regret_sum / total
+    
+    regret_reduction_pct = 0.0
+    if mean_baseline_regret > 0:
+        regret_reduction_pct = ((mean_baseline_regret - mean_intervention_regret) / mean_baseline_regret) * 100
 
     return {
-        "n_positions": len(holdout_positions),
-        "before": {"agent": "SearchAgent (fixed depth)", "mean_abs_regret": round(mean_before, 3) if mean_before is not None else None},
-        "after": {"agent": "AdaptiveSearchAgent (complexity-based depth)", "mean_abs_regret": round(mean_after, 3) if mean_after is not None else None},
-        "improvement_pct": improvement_pct,
-        "before_records": before["records"],
-        "after_records": after["records"],
+        "n_positions": total,
+        "baseline_accuracy": (baseline_matches / total) * 100,
+        "intervention_accuracy": (intervention_matches / total) * 100,
+        "mean_baseline_regret": round(mean_baseline_regret, 3),
+        "mean_intervention_regret": round(mean_intervention_regret, 3),
+        "regret_reduction_pct": round(regret_reduction_pct, 2),
+        "generalized": regret_reduction_pct > 15.0  # Threshold to prove it wasn't just noise
     }

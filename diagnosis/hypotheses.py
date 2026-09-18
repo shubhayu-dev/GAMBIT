@@ -1,60 +1,111 @@
 """
-Hypothesis Generation Registry (GAMBIT Step 11/12).
-
-This module defines the architectural parameter registry for the current agent.
-For the classical SearchAgent MVP, the hypotheses are deterministic and tied
-directly to the agent's exposed knobs: search depth, evaluation heuristics,
-and time budget. 
-
-By explicitly defining the `experiment_schema`, this acts as the exact JSON 
-template that the Gemini LLM Reasoner will use to dynamically generate and 
-execute its own A/B tests in future pipeline iterations.
+Dynamic parameter discovery and calculated heuristic guessing.
+Supports both internal Python agents and external UCI binaries without hardcoding.
 """
 
-from typing import Dict, List
+import subprocess
+from typing import Any, Dict, List
 
 
-def generate_hypotheses(dimension: str) -> List[Dict]:
+def discover_agent_parameters(engine_command_or_agent: Any) -> List[Dict[str, Any]]:
     """
-    Generates concrete, testable hypotheses for agent underperformance in a given dimension.
-    Returns the hypothesis statement alongside the exact control/treatment parameters 
-    required for diagnostic_experiment.py to execute the A/B test.
+    Introspects an agent to discover its controllable knobs dynamically.
+    For UCI binaries, parses 'option name ... type ... min ... max'.
     """
-    return [
-        {
-            "id": "H1",
-            "name": "Search Depth Limitation",
-            "statement": (f"The agent's search depth is insufficient to resolve tactical "
-                          f"lines in {dimension} positions, resulting in high regret."),
-            "test": "Sweep search depth (shallow vs deep) at fixed time budget.",
-            "experiment_schema": {
-                "variable": "max_depth",
-                "control": 2,
-                "treatment": 4
-            }
-        },
-        {
-            "id": "H2",
-            "name": "Evaluation Function Weakness",
-            "statement": (f"The static evaluation function misjudges {dimension} positions "
-                          f"even when search explores the correct lines."),
-            "test": "Ablate the evaluation function (material-only vs material+PST).",
-            "experiment_schema": {
-                "variable": "evaluator",
-                "control": "material",
-                "treatment": "material_pst"
-            }
-        },
-        {
-            "id": "H3",
-            "name": "Time Budget Insufficiency",
-            "statement": (f"The agent is compute-starved and cannot reach a useful depth "
-                          f"in {dimension} positions within the allotted time."),
-            "test": "Sweep time budget (100ms vs 600ms) with a high theoretical max depth.",
-            "experiment_schema": {
-                "variable": "time_budget_ms",
-                "control": 100,
-                "treatment": 600
-            }
-        },
+    discovered_knobs = []
+
+    if isinstance(engine_command_or_agent, str):
+        try:
+            proc = subprocess.Popen(
+                [engine_command_or_agent],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            proc.stdin.write("uci\n")
+            proc.stdin.flush()
+
+            while True:
+                line = proc.stdout.readline()
+                if not line or line.strip() == "uciok":
+                    break
+                line = line.strip()
+                if line.startswith("option name"):
+                    parts = line.split()
+                    name_idx = parts.index("name") + 1
+                    type_idx = parts.index("type")
+                    opt_name = " ".join(parts[name_idx:type_idx])
+                    opt_type = parts[type_idx + 1]
+
+                    knob_info = {"name": opt_name, "type": opt_type, "source": "uci_option"}
+                    if "min" in parts and "max" in parts:
+                        knob_info["min"] = float(parts[parts.index("min") + 1])
+                        knob_info["max"] = float(parts[parts.index("max") + 1])
+                    discovered_knobs.append(knob_info)
+            proc.terminate()
+        except Exception:
+            pass # Fallback if UCI binary fails to load
+    elif hasattr(engine_command_or_agent, "get_configurable_knobs"):
+        discovered_knobs = engine_command_or_agent.get_configurable_knobs()
+
+    universal_search_knobs = [
+        {"name": "depth_escalation", "type": "search_control", "dimension": "max_depth"},
+        {"name": "time_budget_escalation", "type": "search_control", "dimension": "time_budget_ms"},
     ]
+    return universal_search_knobs + discovered_knobs
+
+
+def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[Dict]) -> List[Dict]:
+    """
+    Analyzes blunder telemetry to make calculated guesses, assigning a confidence
+    score to prioritize which empirical tests to run first.
+    """
+    depth = blunder.get("agent_depth", 0)
+    neural_disagree = abs(blunder.get("neural_disagreement", 0.0))
+    trace = blunder.get("agent_pv_trace", [])
+    
+    max_eval_in_trace = max([t.get("eval", 0.0) for t in trace]) if trace else 0.0
+    scored_hypotheses = []
+    
+    # 1. Horizon Search (Depth)
+    depth_score = 50
+    if depth < 5:
+        depth_score += 30
+    if max_eval_in_trace < 2.0:
+        depth_score += 15
+        
+    scored_hypotheses.append({
+        "action": "scale_depth",
+        "test_sequence": [depth + 2, depth + 4],
+        "description": "Test search horizon expansion",
+        "confidence": depth_score
+    })
+
+    # 2. Compute Choke (Time Budget)
+    time_score = 40
+    if depth <= 3: 
+        time_score += 45
+        
+    scored_hypotheses.append({
+        "action": "scale_time",
+        "test_sequence": [600, 2000], 
+        "description": "Test compute starvation",
+        "confidence": time_score
+    })
+
+    # 3. Static Distortions (Evaluator/Material Weights)
+    eval_score = 30
+    if neural_disagree > 2.0:
+        eval_score += 50
+    if max_eval_in_trace > 5.0:
+        eval_score += 40
+        
+    eval_knobs = [k for k in available_knobs if k["source"] == "uci_option"]
+    if eval_knobs:
+        scored_hypotheses.append({
+            "action": "perturb_options",
+            "knobs": eval_knobs,
+            "description": "Test evaluation weight adjustments",
+            "confidence": eval_score
+        })
+
+    scored_hypotheses.sort(key=lambda x: x["confidence"], reverse=True)
+    return scored_hypotheses

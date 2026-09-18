@@ -140,6 +140,10 @@ def main():
             anomaly_summary=anomaly_summary,
             case_studies=case_studies
         )
+        print("\n" + "-" * 40)
+        print("  PAYLOAD BEING SENT TO GEMINI:")
+        print(json.dumps(evidence, indent=2))
+        print("-" * 40 + "\n")
         llm_diagnosis = call_llm_reasoner(evidence)
         
         print("\n" + "─" * 50)
