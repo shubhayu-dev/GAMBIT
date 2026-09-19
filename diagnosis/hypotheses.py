@@ -46,9 +46,14 @@ def discover_agent_parameters(engine_command_or_agent: Any) -> List[Dict[str, An
     elif hasattr(engine_command_or_agent, "get_configurable_knobs"):
         discovered_knobs = engine_command_or_agent.get_configurable_knobs()
 
+    # FIX: these two need a "source" key too -- form_prioritized_hypotheses()
+    # filters on k["source"] == "uci_option", and a plain k["source"] lookup
+    # (no .get()) on an entry missing the key raised KeyError the moment any
+    # blunder reached the "perturb_options" branch. Tagged "search_control"
+    # here so that filter now excludes them cleanly instead of crashing.
     universal_search_knobs = [
-        {"name": "depth_escalation", "type": "search_control", "dimension": "max_depth"},
-        {"name": "time_budget_escalation", "type": "search_control", "dimension": "time_budget_ms"},
+        {"name": "depth_escalation", "type": "search_control", "dimension": "max_depth", "source": "search_control"},
+        {"name": "time_budget_escalation", "type": "search_control", "dimension": "time_budget_ms", "source": "search_control"},
     ]
     return universal_search_knobs + discovered_knobs
 
@@ -59,7 +64,8 @@ def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[D
     score to prioritize which empirical tests to run first.
     """
     depth = blunder.get("agent_depth", 0)
-    neural_disagree = abs(blunder.get("neural_disagreement", 0.0))
+    neural_disagree_val = blunder.get("neural_disagreement")
+    neural_disagree = abs(neural_disagree_val) if neural_disagree_val is not None else 0.0
     trace = blunder.get("agent_pv_trace", [])
     
     max_eval_in_trace = max([t.get("eval", 0.0) for t in trace]) if trace else 0.0
@@ -98,7 +104,9 @@ def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[D
     if max_eval_in_trace > 5.0:
         eval_score += 40
         
-    eval_knobs = [k for k in available_knobs if k["source"] == "uci_option"]
+    # .get() rather than k["source"]: defensive against any future knob
+    # source that forgets to tag itself (see discover_agent_parameters fix).
+    eval_knobs = [k for k in available_knobs if k.get("source") == "uci_option"]
     if eval_knobs:
         scored_hypotheses.append({
             "action": "perturb_options",

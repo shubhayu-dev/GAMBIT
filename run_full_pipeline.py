@@ -16,14 +16,20 @@ from experiments.lichess_data import load_lichess_positions, RAW_ZST_PATH
 from engine.agents import SearchAgent
 from experiments.benchmark import diagnostic_holdout_split
 from experiments.runner import run_experiment
-from analysis.profile import build_profile, tag_records
+from analysis.profile import build_profile  # tag_records no longer used -- see step 3/4 rewrite
 from analysis.anomaly import detect_anomalies
 from analysis.report import format_profile_report
-from diagnosis.hypotheses import generate_hypotheses
-from diagnosis.failure_detection import detect_primary_weakness, describe_weakness
+# FIX (see chat writeup): generate_hypotheses, run_diagnostic_suite/rank_hypotheses,
+# and apply_intervention_and_validate no longer exist in this version's
+# diagnosis/ modules -- these imports crashed on line 1 of execution. Updated
+# to the current API: failure_detection.extract_blunders() replaces the old
+# inline blunder-extraction code below; diagnostic_experiment.run_empirical_investigation()
+# replaces run_diagnostic_suite(); intervention.extract_dominant_fix() +
+# evaluate_intervention() replace apply_intervention_and_validate().
+from diagnosis.failure_detection import detect_primary_weakness, describe_weakness, extract_blunders
 from diagnosis.llm_reasoner import build_evidence_payload, call_llm_reasoner
-from diagnosis.diagnostic_experiment import run_diagnostic_suite, rank_hypotheses
-from diagnosis.intervention import apply_intervention_and_validate
+from diagnosis.diagnostic_experiment import run_empirical_investigation
+from diagnosis.intervention import extract_dominant_fix, evaluate_intervention
 from dashboard.report_html import build_report_html
 
 DEVIATIONS = [
@@ -92,144 +98,151 @@ def main():
         print(f"  Disagreement analysis skipped: {e}")
         disagreement_stats = None
 
-    # --- 3. Failure Detection & Hypotheses ---
-    print("\n[3/6] Detecting primary weakness + generating candidate hypotheses...")
+    # --- 3. Failure Detection + Empirical Investigation ---
+    # FIX (see chat writeup): this whole section previously called functions
+    # (generate_hypotheses, run_diagnostic_suite, apply_intervention_and_validate)
+    # that no longer exist in diagnosis/ -- it crashed on import before any
+    # of this ran. Rewired below to the current diagnosis API:
+    #   failure_detection.extract_blunders()          -- pick the worst blunders
+    #   diagnostic_experiment.run_empirical_investigation() -- search for fixes
+    #   intervention.extract_dominant_fix()            -- find the most common fix
+    #   intervention.evaluate_intervention()            -- check it in-sample, then held-out
+    print("\n[3/6] Detecting primary weakness + isolating blunders...")
     weak_dim, weak_stats = detect_primary_weakness(profile)
     weakness_desc = describe_weakness(weak_dim, weak_stats)
     print(f"  {weakness_desc}")
-    
-    # 3a. Candidate hypotheses
-    hyps = generate_hypotheses(weak_dim)
-    for h in hyps:
-        print(f"  {h['id']}: {h['name']} — {h['statement']}")
-        schema = h["experiment_schema"]
-        print(f"      -> Test Plan: {schema['variable']} (Control: {schema['control']} vs Treatment: {schema['treatment']})")
 
-    # 3b. Extract glass-box blunder case studies for the LLM
-    blunders = sorted(
-        [r for r in baseline["records"] if r.get("regret", 0.0) > 0 and not r.get("decision_match", False)],
-        key=lambda r: r.get("regret", 0.0),
-        reverse=True
+    blunders = extract_blunders(
+        baseline["records"], top_k=5, min_regret=1.0,
+        disagreement_records=enriched if disagreement_stats else None,
     )
-    
-    # MICRO-BATCHING: Only send the top 2 worst blunders to the LLM
-    case_studies = [
-        {
-            "position": b.get("position"),
-            "puzzle_id": b.get("puzzle_id"),
-            "chosen_move": b.get("chosen_move"),
-            "reference_move": b.get("reference_move"),
-            "regret": b.get("regret"),
-            "agent_depth": b.get("agent_depth_reached"),
-            "agent_pv_line": b.get("agent_pv_line"),
-            "agent_pv_trace": b.get("agent_pv_trace", []),
-            "reference_pv_line": b.get("reference_pv_line", ""),
-        }
-        for b in blunders[:2]
-    ]
+    print(f"  Isolated {len(blunders)} blunders (top by regret) to investigate.")
 
-    # 3c. Gemini LLM Reasoning
-    print("\n  [LLM] Asking Gemini to reason with glass-box telemetry...")
+    # 3a. Empirically search each blunder for a knob that recovers the
+    # reference move. NOTE: a match here is a candidate explanation, not a
+    # validated one -- see validation_status on each record, and step 4/5
+    # below where the dominant candidate is actually checked against data.
+    proven_ledger = run_empirical_investigation(SearchAgent, blunders, seed=100)
+    for rec in proven_ledger:
+        print(f"  [{rec['validation_status']}] {rec['proven_cause']}")
+
+    # 3b. Gemini LLM reasoning over the top 2 cases (token budget), same
+    # micro-batching the original had.
+    print("\n  [LLM] Asking Gemini to reason over the investigation ledger...")
     llm_diagnosis = {}
     try:
         evidence = build_evidence_payload(
-            weak_dimension=weak_dim, 
-            weak_stats=weak_stats, 
-            hypotheses=hyps,
+            weak_dimension=weak_dim,
+            weak_stats=weak_stats,
             disagreement_stats=disagreement_stats,
             anomaly_summary=anomaly_summary,
-            case_studies=case_studies
+            proven_ledger=proven_ledger[:2],
         )
         print("\n" + "-" * 40)
         print("  PAYLOAD BEING SENT TO GEMINI:")
         print(json.dumps(evidence, indent=2))
         print("-" * 40 + "\n")
         llm_diagnosis = call_llm_reasoner(evidence)
-        
+
         print("\n" + "─" * 50)
-        print(" GEMINI GLASS-BOX DIAGNOSIS")
+        print(" GEMINI DIAGNOSIS")
         print("─" * 50)
-        print(f" Interpretation: {llm_diagnosis.get('interpretation')}")
-        print(f" Top Hypothesis: {llm_diagnosis.get('best_supported_hypothesis')}")
-        print(f" Next Experiment: {llm_diagnosis.get('suggested_next_experiment')}")
-        
+        print(f" Interpretation:      {llm_diagnosis.get('interpretation')}")
+        print(f" Proven fixes summary: {llm_diagnosis.get('proven_fixes_summary')}")
+        print(f" Architectural rec:   {llm_diagnosis.get('architectural_recommendation')}")
+        if llm_diagnosis.get("caveats"):
+            print(f" Caveats:             {llm_diagnosis.get('caveats')}")
+
         case_diagnoses = llm_diagnosis.get("case_study_analysis", [])
         if case_diagnoses:
-            print("\n Blunder Case Studies (Move-by-Move Refutation):")
+            print("\n Blunder Case Studies:")
             for cs in case_diagnoses:
                 print(f"   • Position: {cs.get('position')}")
                 if "divergence_analysis" in cs:
                     print(f"     Divergence: {cs.get('divergence_analysis')}")
-                print(f"     Diagnosis:  {cs.get('diagnosis')}")
+                print(f"     Fix explanation: {cs.get('empirical_fix_explanation')}")
         print("─" * 50 + "\n")
     except Exception as e:
         print(f"  [LLM Skipped]: {e}")
 
-    # --- 4. Diagnostic Experiments ---
-    print("\n[4/6] Running diagnostic experiments for H1/H2/H3...")
-    tagged = tag_records(baseline["records"])
-    weak_records = {
-        "opening": [r for r in tagged if r["game_phase"] == "opening"],
-        "middlegame": [r for r in tagged if r["game_phase"] == "middlegame"],
-        "endgame": [r for r in tagged if r["game_phase"] == "endgame"],
-        "tactical_proxy": [r for r in tagged if r["tactical_bucket"] == "high_complexity"],
-        "positional_proxy": [r for r in tagged if r["tactical_bucket"] == "low_complexity"],
-        "defensive_proxy": [r for r in tagged if r["is_defensive"]],
-    }.get(weak_dim, tagged)
+    # Adapter: dashboard/report_html.py expects the OLD llm_diagnosis shape
+    # (interpretation/best_supported_hypothesis/case_study_analysis[].diagnosis).
+    # Rather than rewrite report_html.py's rendering (out of scope for this
+    # fix), translate the new schema into the old field names it reads, so
+    # the dashboard keeps working unmodified.
+    llm_diagnosis_for_report = dict(llm_diagnosis) if llm_diagnosis else {}
+    if llm_diagnosis:
+        llm_diagnosis_for_report["best_supported_hypothesis"] = llm_diagnosis.get("proven_fixes_summary")
+        llm_diagnosis_for_report["case_study_analysis"] = [
+            {**cs, "diagnosis": cs.get("empirical_fix_explanation")}
+            for cs in llm_diagnosis.get("case_study_analysis", [])
+        ]
 
-    weak_positions = [
-        {
-            "fen": r["position"],
-            "phase": r["game_phase"],
-            "reference_move_lichess": r.get("reference_move"),
-            "puzzle_id": r.get("puzzle_id"),
-            "game_id": r.get("game_id"),
-        }
-        for r in weak_records
-    ]
-    if len(weak_positions) < 2:
-        weak_positions = diagnostic
+    # --- 4. In-sample check of the dominant candidate fix ---
+    print("\n[4/6] Extracting the dominant candidate fix from the ledger...")
+    dominant_fix_desc, intervention_kwargs = extract_dominant_fix(proven_ledger)
+    print(f"  Dominant candidate: {dominant_fix_desc} -> {intervention_kwargs}")
 
-    evidence = run_diagnostic_suite(weak_positions, hypotheses=hyps, time_budget_ms=300, seed=100)
-    ranked = rank_hypotheses(evidence)
-    for r in ranked:
+    if intervention_kwargs:
+        diagnostic_check = evaluate_intervention(
+            SearchAgent, blunders, baseline_kwargs={"max_depth": 3}, intervention_kwargs=intervention_kwargs, seed=100,
+        )
         print(
-            f"  {r['hypothesis']}: {r['label_a']} -> {r['label_b']}, "
-            f"regret {r['mean_abs_regret_a']} -> {r['mean_abs_regret_b']} "
-            f"({r['improvement_pct']}% improvement, p={r['p_value']})"
+            f"  In-sample (same blunders used to find the fix -- expected to look good, "
+            f"NOT evidence of generalization): "
+            f"regret {diagnostic_check.get('mean_baseline_regret')} -> {diagnostic_check.get('mean_intervention_regret')} "
+            f"({diagnostic_check.get('regret_reduction_pct')}% reduction, metric={diagnostic_check.get('regret_metric')})"
         )
-
-    # --- 5. Evidence-Gated Intervention ---
-    print("\n[5/6] Evaluating diagnostic evidence for intervention gating...")
-    top_hyp = ranked[0] if ranked else None
-    has_valid_evidence = (
-        top_hyp is not None 
-        and top_hyp.get("improvement_pct", 0) > 0 
-        and top_hyp.get("p_value", 1.0) < 0.05
-    )
-
-    if has_valid_evidence and top_hyp["hypothesis"] == "H1":
-        intervention_result = apply_intervention_and_validate(
-            holdout, base_depth=3, boosted_depth=5, complexity_threshold=30, time_budget_ms=300, seed=500
-        )
-    elif has_valid_evidence and top_hyp["hypothesis"] == "H3":
-        print(f"  Intervention confirmed: Time budget expansion based on {top_hyp['hypothesis']}.")
-        before_eval = run_experiment(SearchAgent, {"max_depth": 3}, holdout, time_budget_ms=100, reference_depth=2, seed=500)
-        after_eval = run_experiment(SearchAgent, {"max_depth": 3}, holdout, time_budget_ms=600, reference_depth=2, seed=500)
-        imp = ((before_eval["mean_regret"] - after_eval["mean_regret"]) / max(1e-6, before_eval["mean_regret"])) * 100
-        intervention_result = {
-            "status": "applied",
-            "type": "time_budget_expansion",
-            "before": {"mean_abs_regret": round(before_eval["mean_regret"], 3)},
-            "after": {"mean_abs_regret": round(after_eval["mean_regret"], 3)},
-            "improvement_pct": round(imp, 2),
-            "n_positions": len(holdout),
-        }
-        print(f"  Before (100ms): mean regret = {intervention_result['before']['mean_abs_regret']}")
-        print(f"  After (600ms):  mean regret = {intervention_result['after']['mean_abs_regret']}")
-        print(f"  Held-out Improvement: {intervention_result['improvement_pct']}%")
     else:
-        print("  Intervention skipped: no hypothesis demonstrated statistically significant improvement.")
+        diagnostic_check = {}
+        print("  No candidate fix to check -- no investigation_log entry recovered a reference move.")
+
+    # Adapter: report_html.py's hyp_rows table wants a list of dicts shaped
+    # like the old H1/H2/H3 rows. We only have one candidate now (the
+    # dominant fix), so it's a single row. p_value is deliberately left
+    # None -- there is no significance test in this methodology, and
+    # reporting a fabricated one would be worse than reporting none.
+    ranked = [{
+        "hypothesis": "Empirical",
+        "label_a": "baseline",
+        "label_b": dominant_fix_desc,
+        "mean_abs_regret_a": diagnostic_check.get("mean_baseline_regret"),
+        "mean_abs_regret_b": diagnostic_check.get("mean_intervention_regret"),
+        "improvement_pct": diagnostic_check.get("regret_reduction_pct"),
+        "p_value": None,
+    }] if intervention_kwargs else []
+
+    # --- 5. Held-out validation of the dominant fix ---
+    print("\n[5/6] Validating the dominant fix on held-out positions never used above...")
+    if intervention_kwargs:
+        # `holdout` positions come from diagnostic_holdout_split() with raw
+        # Lichess field names (fen / reference_move_lichess); evaluate_intervention
+        # expects the run_experiment record shape (position / reference_move).
+        holdout_for_eval = [
+            {"position": p["fen"], "reference_move": p.get("reference_move_lichess")}
+            for p in holdout
+        ]
+        held_out_eval = evaluate_intervention(
+            SearchAgent, holdout_for_eval, baseline_kwargs={"max_depth": 3}, intervention_kwargs=intervention_kwargs, seed=500,
+        )
+        print(
+            f"  Held-out: regret {held_out_eval.get('mean_baseline_regret')} -> "
+            f"{held_out_eval.get('mean_intervention_regret')} "
+            f"({held_out_eval.get('regret_reduction_pct')}% reduction, metric={held_out_eval.get('regret_metric')})"
+        )
+        print(f"  Generalized: {held_out_eval.get('generalized')}")
+
+        intervention_result = {
+            "status": "applied" if held_out_eval.get("generalized") else "rejected",
+            "type": dominant_fix_desc,
+            "before": {"mean_abs_regret": held_out_eval.get("mean_baseline_regret", 0.0)},
+            "after": {"mean_abs_regret": held_out_eval.get("mean_intervention_regret", 0.0)},
+            "improvement_pct": held_out_eval.get("regret_reduction_pct", 0.0),
+            "n_positions": held_out_eval.get("n_positions", len(holdout)),
+            "regret_metric": held_out_eval.get("regret_metric"),
+        }
+    else:
+        print("  Skipped: no candidate fix from step 4 to validate.")
         intervention_result = {
             "status": "rejected",
             "improvement_pct": 0.0,
@@ -241,7 +254,7 @@ def main():
     # --- 6. Build Final Report ---
     print("\n[6/6] Building final report...")
     html = build_report_html(
-        agent_name, profile, weak_dim, weakness_desc, ranked, intervention_result, DEVIATIONS, llm_diagnosis
+        agent_name, profile, weak_dim, weakness_desc, ranked, intervention_result, DEVIATIONS, llm_diagnosis_for_report
     )
     out_path = ROOT / "data" / "gambit_report.html"
     out_path.parent.mkdir(exist_ok=True)

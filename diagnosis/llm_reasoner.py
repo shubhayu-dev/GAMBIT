@@ -1,6 +1,22 @@
 """
 LLM reasoning layer powered by Google Gemini.
-Translates empirical diagnostic evidence and the Proven Ledger into post-mortems.
+Translates empirical diagnostic evidence and the investigation ledger into post-mortems.
+
+FIXES (see chat writeup):
+1. Restored the anti-fabrication instruction ("do not invent numbers, moves,
+   or claims not present in the payload") that this version had dropped.
+   That instruction existed for a reason -- the LLM is the last line
+   between raw telemetry and a human reading a report, and this project's
+   own audit history (train/test leakage, the regret-formula bug) is
+   exactly the kind of thing an unconstrained LLM writeup would have
+   confidently narrated over instead of catching.
+2. Each proven_ledger entry now carries a `validation_status` field (see
+   diagnosis/diagnostic_experiment.py) that's either "unresolved" or
+   "single_position_match (unconfirmed -- ...)" -- never "proven" outright,
+   since a single knob bump matching one reference move once is not a
+   validated fix. The prompt now explicitly tells the model to reflect
+   that hedge in its language instead of asserting the fix "successfully
+   eliminated" anything.
 """
 
 import json
@@ -14,26 +30,32 @@ load_dotenv()
 SYSTEM_PROMPT = """You are the lead diagnostic reasoning engine of GAMBIT, an automated chess AI debugging framework.
 You receive:
 1. Aggregate capability metrics.
-2. A Proven Ledger of empirical experiments where parameter interventions (depth expansion, evaluation weights, time budgets) were tested directly against blunders.
+2. An investigation ledger of empirical experiments where parameter interventions (depth expansion, evaluation weights, time budgets) were tested against specific blunders.
 
 Your job:
 1. Analyze why the agent blundered initially using the principal variations.
 2. State the exact tactical or strategic reality the agent missed.
-3. Explain WHY the empirically proven parameter fix successfully eliminated the blunder based on chess search mechanics.
+3. Explain the mechanism by which the tested parameter change could plausibly resolve the mistake, based on chess search mechanics.
+
+Rules:
+- Do not fabricate numbers, moves, positions, or claims that are not present in the payload. If the payload doesn't contain enough information to explain something, say so explicitly rather than guessing.
+- Every ledger entry has a `validation_status` field. If it is anything other than a fully validated/generalized result, your language MUST reflect that: use hedged phrasing ("recovered the reference move on this position", "a candidate fix") rather than assertive phrasing ("resolved", "eliminated", "fixed"). Only use confirmatory language ("resolved", "fixed") for entries explicitly marked as validated/generalized.
+- If a case's investigation_log shows no successful test, say plainly that no tested intervention explained the blunder -- do not invent one.
 
 Output strict JSON only.
 
 Expected JSON schema:
 {
   "interpretation": "High-level summary of agent failure mode across the cohort.",
-  "proven_fixes_summary": "Summary of which empirical interventions reliably restored optimal play.",
+  "proven_fixes_summary": "Summary of which interventions were tested and which (if any) are actually validated vs. still candidates.",
   "case_study_analysis": [
      {
        "position": "FEN string",
        "divergence_analysis": "Step 1: Note deviation ply. Step 2: Detail tactical line missed.",
-       "empirical_fix_explanation": "Explain why the tested parameter fix resolved the mistake."
+       "empirical_fix_explanation": "Explain the candidate fix and its mechanism, hedged per validation_status. If unresolved, say so."
      }
   ],
+  "caveats": ["Limitations in the evidence -- e.g. single-position matches not yet validated on held-out data"],
   "architectural_recommendation": "Next code-level fix for the engine developer."
 }"""
 
@@ -63,7 +85,13 @@ def build_evidence_payload(
 def call_llm_reasoner(
     evidence: Dict,
     api_key: Optional[str] = None,
-    model_name: str = "gemini-2.5-flash"
+    # Reverted to gemini-3.6-flash: this version had silently downgraded to
+    # gemini-2.5-flash with no comment explaining why. An unlogged model
+    # swap changes what a report says without anyone deciding to change it
+    # -- if that downgrade was intentional (e.g. cost or availability),
+    # leave a comment saying so; if not, this is the original value,
+    # consistent with the commentary module (analysis/commentary.py).
+    model_name: str = "gemini-3.6-flash"
 ) -> Dict:
     """Sends diagnostic telemetry to Gemini with exponential backoff for rate limits."""
     os.makedirs("data", exist_ok=True)
