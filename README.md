@@ -20,7 +20,9 @@ GAMBIT/
 ├── docs/            # design specs (01-10)
 ├── engine/          # C++ core: board, moves, search, eval, agents
 ├── experiments/     # experiment runner, parallel execution
-├── analysis/        # metrics, statistics, behavioral profiling
+├── analysis/        # metrics, statistics, behavioral profiling,
+│                    # move commentary (commentary.py, rule_based_commentary.py,
+│                    # commentary_report.py, run_commentary_demo.py)
 ├── diagnosis/        # hypothesis generation, diagnostic experiments
 ├── dashboard/       # Streamlit UI
 └── data/            # SQLite + Parquet + JSON (gitignored bulk data)
@@ -123,3 +125,61 @@ more data, or be shelved until a better target exists; and `game_phase()`
 needs recalibrating against the real data now available as ground truth.
 Full report, including the complete claims-and-confidence table and exact
 next steps: `docs/15_audit_round3.md`.
+
+## Diagnosis pipeline fixes (this round)
+The diagnosis pipeline (`diagnosis/`) was reworked from paired-hypothesis
+statistical testing to a per-blunder empirical search ("does some knob
+setting recover the reference move on this exact position"), and the
+rewrite shipped with several breaking bugs: `diagnostic_experiment.py`
+depended on `python-chess` and a `select_move()` method neither exists
+anywhere in this codebase (real agents expose `get_move(environment.Board,
+...)`); `hypotheses.py` had a `KeyError` on any knob missing a `source` key;
+`intervention.py` compared two different regret metrics (continuous vs.
+binary-match) in the same subtraction; and `run_full_pipeline.py` still
+called four functions removed from the new API. All fixed — see
+`CHANGE_LOG.md` for the full list, each verified against the real engine,
+not just import-checked.
+
+**Methodology note carried into the fix, not resolved by it:** a knob bump
+that makes the agent match the reference move on ONE position is a much
+weaker claim than the old paired Wilcoxon test across a diagnostic set.
+Every ledger entry from `diagnostic_experiment.run_empirical_investigation()`
+now carries an explicit `validation_status` (never silently "proven"), and
+`intervention.py`'s held-out check is what actually earns the word
+"generalized" — read `diagnosis/diagnostic_experiment.py`'s module docstring
+before trusting a case study's `proven_cause` field at face value.
+
+## Move commentary system (this round)
+A new, separate subsystem — deliberately NOT part of `diagnosis/llm_reasoner.py`,
+since that module's job is feeding the DIAGNOSE step, not narrating individual
+moves for a human reading a game. Lives in `analysis/`:
+
+- `rule_based_commentary.py` — filters out moves that don't need an LLM at
+  all (only-legal-move, forced check replies, simple recaptures, mate).
+- `commentary.py` — batches whatever's left into a strict-JSON LLM call.
+  Supports both Gemini (`provider="gemini"`) and a local Ollama model
+  (`provider="ollama"`, default, currently `qwen2.5:7b-instruct`) — see
+  `SETUP.md` for getting Ollama running. Auto-retries any move a batch
+  response dropped, one at a time, since smaller local models don't
+  reliably cover every item in a multi-move JSON array.
+- `commentary_report.py` — renders the result as an actual browser-openable
+  HTML report (per-move board snapshot, tag, explanation), not just
+  terminal output.
+- `run_commentary_demo.py` — end-to-end runnable driver; see `SETUP.md`.
+
+**The key design decision, and the thing that makes the explanations
+actually answer "why did the agent do this"**: `engine/search.py`'s
+`alpha_beta()`/`search_best_move()` now optionally capture `root_trace` —
+every root move the search *actually compared* in the same live,
+time-bounded call that chose the move, including whether the deadline cut
+that comparison short (`fully_searched: false`). This engine runs on a
+wall-clock time budget, not a fixed node count, and it's common for the
+search to compare only a handful of the legal moves available before time
+runs out — sometimes as few as 3-4 out of 25-30 in the middlegame. An
+earlier version of this reconstructed "alternatives" with a fresh,
+unconstrained re-search instead of capturing this live — that produces a
+*different and less honest* comparison (it can make the played move look
+like it lost to options the live search never even reached), so
+`evaluate_root_candidates()` in `search.py` is kept only for the different
+question "what would unlimited time have found," clearly labeled as such,
+and is not used for commentary.
