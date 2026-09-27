@@ -1,93 +1,84 @@
 # SETUP
 
-This covers getting the repo running end to end: the core engine (no
-external dependencies), the diagnosis pipeline (needs Gemini), and the move
-commentary system (needs a local Ollama model).
-
 ## 1. Prerequisites
 
 - Python 3.10+
-- A virtualenv (recommended): `python3 -m venv .venv && source .venv/bin/activate`
+- A virtualenv: `python3 -m venv .venv && source .venv/bin/activate`
 
-There is no `requirements.txt` in the repo yet — install what each piece
-below needs directly. If you're setting this up repeatedly, consider
-freezing one (`pip freeze > requirements.txt`) once your environment works.
+No `requirements.txt` yet — install what each piece below needs directly.
 
-## 2. Core engine — zero setup
+## 2. Core engine — zero external dependencies
 
-`engine/`, `experiments/`, and the rules/search/evaluation code have no
-external dependencies (deliberately — see `engine/README.md` and
-`PROJECT_CONSTITUTION.md`: no `python-chess`, no Stockfish). If all you want
-is to run self-play games or the search engine directly:
+`engine/environment.py`, `search.py`, `evaluation.py`, `agents.py` (the
+`SearchAgent`/`MaterialAgent`/`RandomAgent` path) need nothing beyond the
+standard library, deliberately (see `PROJECT_CONSTITUTION.md`).
 
 ```bash
 cd GAMBIT
 PYTHONPATH=engine python3 -c "
 from environment import Board, START_FEN
 from agents import SearchAgent
-board = Board(START_FEN)
-move = SearchAgent(max_depth=3).get_move(board, time_budget_ms=200)
+move = SearchAgent(max_depth=3).get_move(Board(START_FEN), time_budget_ms=200)
 print(move.uci())
 "
 ```
 
-**Known gap, not fixed by this setup:** `engine/neural_agent.py` defines
-`class ChessValueNet(nn.Module)` unconditionally even when its own
-`try/except ImportError` for `torch` fails, so importing anything that
-pulls in `neural_agent.py` (including `run_full_pipeline.py`) will crash
-with `NameError: name 'nn' is not defined` if `torch` isn't installed.
-Install `torch` if you need that path, or expect this to fail until
-`neural_agent.py` itself is fixed to guard the class definition too.
+`engine/neural_agent.py` additionally needs `scikit-learn`
+(`pip install scikit-learn`) for `MLPRegressor` — optional, only import this
+module if you're using the neural value agent or its training data.
 
-## 3. Diagnosis pipeline (`run_full_pipeline.py`) — needs Gemini
+## 3. Diagnosis pipeline
+
+Two parallel systems currently coexist here — see `README.md`'s Phase 4
+section and `CONTRIBUTING.md` for why, and note that unifying them is an
+open item, not something this setup (or the recent integration) resolved:
+
+- **`run_full_pipeline.py`** — the older paired-hypothesis (H1/H2/H3) A/B
+  system.
+- **`run_blunder_diagnosis_pipeline.py`** — the newer `FailureCode` /
+  "Proven Ledger" empirical system.
+
+Both need:
 
 ```bash
 pip install google-genai python-dotenv zstandard
 ```
 
-Create a `.env` file in the repo root (same directory you run scripts from):
+`.env` in the repo root:
 
 ```
 GEMINI_API_KEY=your_key_here
 ```
 
-Also needs real Lichess puzzle data (`experiments/lichess_data.py` pulls
-from HuggingFace, not lichess.org directly — see README for why) and, for
-the neural-agent code path specifically, `torch` (see the gap noted above).
+`diagnosis/llm_reasoner.py` also has a local-LLM path
+(`LOCAL_SYSTEM_PROMPT`/`call_local_reasoner`) with a tested rule-based
+fallback (`analysis/rule_based_commentary.py` — NOT the same file as
+`analysis/move_commentary_rules.py`, see section 4) for when no local
+endpoint is reachable; real Lichess data also needs network access this
+sandbox didn't have (`docs/13_lichess_integration.md` covers the HuggingFace
+workaround already integrated).
 
-Run it:
+## 4. Move commentary — needs a local Ollama model (or Gemini)
 
-```bash
-PYTHONPATH=engine:experiments:analysis:diagnosis:dashboard python3 run_full_pipeline.py
-```
-
-## 4. Move commentary (`analysis/run_commentary_demo.py`) — needs Ollama
-
-This is a separate LLM call from the diagnosis pipeline (see README's "Move
-commentary system" section for why it's a distinct module). Default
-provider is a local Ollama model — no API key, but the server needs to be
-running.
+Separate from the diagnosis pipeline above — explains individual moves in
+plain language, for a human reading one game, rather than feeding the
+DIAGNOSE step for a whole blunder cohort. Default provider is local:
 
 ```bash
-# Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull a model. 7b-instruct is a reasonable default for a laptop.
 ollama pull qwen2.5:7b-instruct
-# smaller/faster: qwen2.5:3b-instruct or qwen2.5:1.5b-instruct
-# bigger/better if you have the VRAM: qwen2.5:14b-instruct
+# smaller/faster: qwen2.5:3b-instruct or 1.5b-instruct
+# bigger/better with more VRAM: qwen2.5:14b-instruct
 
-# Confirm it's reachable (installs as a systemd service and should
-# already be running; if this fails, run `ollama serve` manually):
-curl http://localhost:11434/api/tags
+curl http://localhost:11434/api/tags   # confirm it's reachable
+# if not: ollama serve
 
-# Python deps for this path
 pip install requests python-dotenv
 ```
 
-If the model tag you pulled differs from `qwen2.5:7b-instruct` (check with
-`ollama list`), update `model_name=` in the `annotate_game(...)` call near
-the bottom of `analysis/run_commentary_demo.py`'s `main()`.
+If your pulled tag differs from `qwen2.5:7b-instruct` (`ollama list` to
+check), update `model_name=` in `analysis/run_commentary_demo.py`'s
+`annotate_game(...)` call.
 
 Run it:
 
@@ -96,35 +87,33 @@ cd GAMBIT
 PYTHONPATH=engine:analysis python3 analysis/run_commentary_demo.py
 ```
 
-Output: terminal progress, plus a browser-openable report written to
-`data/commentary_report.html` (the script prints the exact path and a
-`file://` link when it finishes).
+Writes a browser-openable report to `data/commentary_report.html` (path and
+`file://` link printed at the end).
 
-**If you'd rather use Gemini for commentary too** (e.g. to compare quality
-against the local model), pass `provider="gemini"` instead of
-`provider="ollama"` in the `annotate_game(...)` call, and follow the
-`GEMINI_API_KEY` setup from section 3.
+**To use Gemini instead** (e.g. to compare quality against the local
+model), pass `provider="gemini"` in the same `annotate_game(...)` call and
+set `GEMINI_API_KEY` as in section 3.
 
-### Tuning notes specific to local models
+### Tuning notes for local models
 
-- `chunk_size` (how many moves go into one LLM call) defaults to 15 for
-  Ollama in the demo script, vs. 40 for Gemini. Smaller local models
-  sometimes stop after generating one item in a multi-item JSON array
-  regardless of chunk size — `commentary.py`'s `annotate_game()`
-  automatically retries any move a batch dropped, one at a time, as a
-  fallback, so this degrades gracefully rather than silently losing moves.
+- `chunk_size` (moves per LLM call) defaults to 15 here vs. 40 for Gemini.
+  Smaller instruct models can stop after one array entry in a multi-item
+  JSON response regardless of chunk size — `annotate_game()` automatically
+  retries whatever a batch drops, one move at a time, so this degrades
+  gracefully rather than silently losing moves.
 - `num_ctx` (8192) and `num_predict` (4096) are set explicitly in
   `commentary.py`'s `_call_ollama()` — Ollama's own defaults (2048 context,
-  a small model-defined output cap) are too small for a multi-move batched
-  payload and will truncate silently otherwise.
+  a small model-defined output cap) truncate a multi-move batched payload
+  silently otherwise.
 
-## 5. Troubleshooting quick reference
+## 5. Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| `ModuleNotFoundError: No module named 'engine'` | You imported `engine.X` somewhere, but `PYTHONPATH=engine:...` puts the *contents* of `engine/` on the path, not a package named `engine`. Use bare `from environment import ...`, not `from engine.environment import ...` — check your editor isn't auto-rewriting this on save. |
-| `ImportError: cannot import name 'classify_game' ... circular import` | Your local copy of a file has extra/duplicated content merged into it. Re-copy the file fresh rather than hand-editing. |
-| Gemini `503 UNAVAILABLE` | Real server-side demand spike, not your setup — `commentary.py`/`llm_reasoner.py` already retry with backoff; if it survives that, wait a few minutes and retry. |
-| Ollama `ConnectionError` | Server not running — `curl http://localhost:11434/api/tags` to check, `ollama serve` to start it. |
-| `NameError: name 'nn' is not defined` importing `neural_agent` | `torch` isn't installed — see section 2. |
-| `.env` file seemingly ignored | Confirm `load_dotenv()` is called *before* any `os.environ.get(...)` check in whichever script you're running — this bit us once already in `run_commentary_demo.py` (fixed), but double-check any new entry point you add. |
+| `ImportError`/`AttributeError` about `chess` or `select_move` anywhere | You're looking at a different, non-authoritative branch's code — this repo's real agents use `environment.Board`/`get_move()` throughout; there is no `python-chess` dependency here. |
+| `ModuleNotFoundError: No module named 'engine'` | `PYTHONPATH=engine:...` puts the *contents* of `engine/` on the path, not a package named `engine`. Use `from environment import ...`, not `from engine.environment import ...`. |
+| Confusing which `rule_based_commentary`-ish file does what | `analysis/rule_based_commentary.py` = diagnosis post-mortem template fallback. `analysis/move_commentary_rules.py` = per-move commentary rule filter. Same original name, different jobs — renamed on integration specifically to stop this confusion from becoming a silent file collision. |
+| Gemini `503 UNAVAILABLE` | Real server-side demand spike — both LLM call sites already retry with backoff; if it survives that, wait a few minutes. |
+| Ollama `ConnectionError` | Server not running — `curl http://localhost:11434/api/tags`, then `ollama serve`. |
+| Regret/timing numbers look inconsistent with older runs | Check whether they predate the worker-contention fix in `experiments/runner.py` (`docs/16_worker_contention_finding.md`) — `n_workers` above your real core count silently corrupted wall-clock budgets before this was found and fixed. |
+| `.env` seemingly ignored | Confirm `load_dotenv()` runs before any `os.environ.get(...)` check in whichever script you're running. |

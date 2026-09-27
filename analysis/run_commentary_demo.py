@@ -1,6 +1,6 @@
 """
 Runnable demo: plays a short self-play game with the real SearchAgent,
-builds a trajectory in the shape rule_based_commentary/commentary expect,
+builds a trajectory in the shape move_commentary_rules/commentary expect,
 runs the rule-based filter, and (if GEMINI_API_KEY is set) sends whatever's
 left to the LLM commentary layer.
 
@@ -34,7 +34,7 @@ from environment import Board, START_FEN
 from agents import SearchAgent
 from evaluation import evaluate
 
-from rule_based_commentary import classify_game
+from move_commentary_rules import classify_game
 
 N_PLIES = 20
 SEARCH_DEPTH = 3
@@ -102,6 +102,7 @@ def main():
 
     if not unhandled:
         print("\nNothing to send to the LLM this game -- done.")
+        _write_html_report(handled, [], trajectory)
         return
 
     # Using a local Ollama server (qwen2.5) instead of Gemini -- no API key
@@ -115,6 +116,7 @@ def main():
             "Start it with `ollama serve` (and make sure you've pulled a model, e.g. "
             "`ollama pull qwen2.5:7b-instruct`), then rerun."
         )
+        _write_html_report(handled, [], trajectory)
         return
 
     from commentary import annotate_game
@@ -149,6 +151,28 @@ def main():
     print("\nLLM commentary:")
     for c in commentary:
         print(f"  ply {c['ply']:>2} {c['move']:>6}  [{c.get('tag')}]  {c['explanation']}")
+
+    _write_html_report(handled, commentary, trajectory)
+
+
+def _write_html_report(handled, commentary, trajectory):
+    """Renders every move (rule-based + LLM) as an actual browser-openable
+    report -- a board snapshot, tag, and explanation per move, in the same
+    dark/gold visual language as dashboard/report_html.py's diagnosis
+    report -- instead of leaving the results as terminal print statements."""
+    from commentary_report import merge_commentary, build_commentary_report_html
+
+    merged = merge_commentary(handled, commentary, trajectory)
+    html = build_commentary_report_html(f"Self-play game ({len(trajectory)} plies)", merged)
+
+    os.makedirs("data", exist_ok=True)
+    out_path = os.path.join("data", "commentary_report.html")
+    with open(out_path, "w") as f:
+        f.write(html)
+
+    abs_path = os.path.abspath(out_path)
+    print(f"\nHuman-readable report written to: {abs_path}")
+    print(f"Open it in a browser: file://{abs_path}")
 
 
 if __name__ == "__main__":

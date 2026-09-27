@@ -13,7 +13,7 @@ must not be merged into the diagnostic payload -- doing so would blur a
 scope boundary the constitution is explicit about.
 
 Design decisions this module encodes (see chat writeup):
-  - Only moves the rule-based pass (rule_based_commentary.py) couldn't
+  - Only moves the rule-based pass (move_commentary_rules.py) couldn't
     explain are sent here -- forced moves, only-legal-moves, and simple
     recaptures are filtered out before this module ever runs.
   - One LLM call per CHUNK of moves (default: one call per game), not one
@@ -353,7 +353,7 @@ def annotate_game(
     """End-to-end: chunk -> call -> flatten back into one list of commentary
     dicts in ply order. This is what a caller (e.g. the dashboard, or a
     post-processing script over stored trajectories) should call after
-    rule_based_commentary.classify_game() has filtered out the obvious moves.
+    move_commentary_rules.classify_game() has filtered out the obvious moves.
 
     llm_kwargs pass through to call_commentary_llm -- e.g.
     annotate_game(moves, provider="ollama", model_name="qwen2.5:7b-instruct")
