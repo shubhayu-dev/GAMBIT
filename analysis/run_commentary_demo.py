@@ -34,11 +34,21 @@ from environment import Board, START_FEN
 from agents import SearchAgent
 from evaluation import evaluate
 
-from move_commentary_rules import classify_game
+from move_commentary_rules import classify_game, describe_move
 
 N_PLIES = 20
 SEARCH_DEPTH = 3
-TIME_BUDGET_MS = 200
+# 200ms was an arbitrary "make the demo run fast" choice, never validated
+# against move quality. Measured directly: this engine (pure Python, no
+# optimization -- by design, see README) does ~1,600 nodes/sec, so 200ms
+# only covers ~15% of legal root moves on average, which produces
+# repetitive, non-chess play (e.g. a rook shuffling a1-b1-a1-b1 for lack of
+# anything better having been compared). 2000ms (10x) took average
+# coverage from 15.6% to 92.4% and eliminated the repetition entirely in a
+# direct A/B test. Game generation for a 20-ply game costs ~27s at this
+# setting instead of ~4s -- worth it for commentary that's actually
+# explaining real chess, not narrating time-pressure noise.
+TIME_BUDGET_MS = 2000
 
 
 def play_game_and_build_trajectory():
@@ -138,6 +148,12 @@ def main():
             # search.py/commentary.py for why that distinction matters.
             "alternatives": step["root_trace"],
             "n_legal_at_root": step["n_legal_at_root"],
+            # Computed deterministically from the real board, not left for
+            # the LLM to infer from FEN + bare UCI -- see
+            # move_commentary_rules.describe_move()'s docstring. qwen2.5:7b
+            # repeatedly mislabeled piece identity (bishop moves called
+            # "the knight") when asked to work this out itself.
+            "move_description": describe_move(step["board_before"], step["move"], step["board_after"]),
         })
 
     print("\nCalling the local Ollama commentary layer (qwen2.5)...")
@@ -146,7 +162,12 @@ def main():
     # the JSON schema partway through a long batch. Tune based on how your
     # model actually does with 15 vs. the full game in one call.
     commentary = annotate_game(
-        llm_input, provider="ollama", model_name="qwen2.5:7b-instruct", chunk_size=15,
+        # chunk_size lowered from 15 to 5: confirmed directly that a batch of
+        # 15 (and even a batch of 2) could still drop everything but the
+        # first entry under qwen2.5:7b's JSON-mode decoding. The automatic
+        # per-move retry in annotate_game() already covers whatever a batch
+        # drops, but fewer retries needed means faster, more reliable runs.
+        llm_input, provider="ollama", model_name="qwen2.5:7b-instruct", chunk_size=5,
     )
     print("\nLLM commentary:")
     for c in commentary:
