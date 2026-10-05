@@ -26,7 +26,7 @@ whether the dominant fix here generalizes to held-out positions.
 import subprocess
 from typing import Any, Dict, List, Optional
 
-from environment import Board  # this project's own board -- not python-chess
+from engine.environment import Board  # this project's own board -- not python-chess
 
 from diagnosis.hypotheses import discover_agent_parameters, form_prioritized_hypotheses
 

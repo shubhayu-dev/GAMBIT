@@ -57,6 +57,14 @@ def build_commentary_payload(moves: List[Dict]) -> Dict:
         n_legal_at_root: int       # total legal moves available, so the LLM
                                    # can say "compared 4 of 27" rather than
                                    # implying every option was weighed.
+        move_description: str      # OPTIONAL but strongly recommended --
+                                   # move_commentary_rules.describe_move()'s
+                                   # ground-truth output: piece identity,
+                                   # capture, check, promotion, computed from
+                                   # the real board, not inferred by the LLM.
+                                   # Added after qwen2.5:7b repeatedly
+                                   # mislabeled piece identity when asked to
+                                   # work this out itself from FEN + bare UCI.
     """
     # FIX: engine.evaluation.evaluate() returns pawn-scale floats (a queen
     # is ~9.0, not ~900), but this payload's fields were named "_cp"
@@ -88,6 +96,7 @@ def build_commentary_payload(moves: List[Dict]) -> Dict:
                     {"move": a["move"], "score_cp": to_cp(a["score"]), "fully_searched": a["fully_searched"]}
                     for a in m.get("alternatives", [])[:8]
                 ],
+                "move_description": m.get("move_description"),
             }
             for m in moves
         ]
@@ -106,7 +115,17 @@ White), the engine's expected principal variation continuing from the chosen mov
 `n_legal_moves_available` (total legal moves in the position), `n_moves_actually_compared` \
 (how many the search reached before its time budget ran out), and `moves_compared_by_search` \
 -- the actual moves it evaluated, in the order it tried them, each with a score and a \
-`fully_searched` flag.
+`fully_searched` flag. You also get `move_description` -- a plain-language, PRE-COMPUTED, \
+ground-truth statement of what the move actually is: which piece moved, its color, whether it \
+captured something (and what), whether it delivers check, promotion. This was computed directly \
+from the real board position in Python, not guessed.
+
+HARD RULE on piece identity: `move_description` is ALWAYS correct about piece identity, capture, \
+and check -- it is not a hint, it is ground truth. Do NOT re-derive or second-guess which piece \
+moved, what (if anything) was captured, or whether the move gives check by parsing the FEN or the \
+UCI notation yourself. State these facts exactly as `move_description` gives them. (This rule \
+exists because earlier runs repeatedly mislabeled piece identity this way -- e.g. calling a \
+bishop move "the knight" -- when asked to work it out unaided from FEN + bare UCI notation.)
 
 CRITICAL CONTEXT: this engine runs on a wall-clock time budget. It frequently does NOT compare \
 every legal move -- alpha-beta cutoffs and the time limit mean the search may stop after only a \

@@ -59,6 +59,53 @@ def _piece_name(board: Board, square: int) -> str:
     return PIECE_NAMES.get(piece.lower(), "piece")
 
 
+def describe_move(board_before: Board, move: Move, board_after: Board) -> str:
+    """Deterministically describes a move in plain language -- piece
+    identity, color, capture, check, promotion, castling -- computed
+    directly from the real board, not left for an LLM to infer from a raw
+    FEN + bare UCI string.
+
+    Why this exists: qwen2.5:7b, given only FEN + UCI notation and asked to
+    explain a move, repeatedly mislabeled piece identity (calling a bishop
+    move "the knight" multiple times in one game, including right after
+    moving that exact bishop twice more). The FEN technically contains
+    full board state, but reliably parsing "which piece is on square X" out
+    of a raw FEN string is apparently not something a 7B model does
+    consistently under commentary-generation load. Since Python already
+    has the real Board object and this is a handful of dict lookups, doing
+    it here removes an entire class of hallucination rather than asking
+    the LLM to get better at FEN parsing.
+    """
+    piece_char = board_before.board[move.from_sq]
+    piece_name = _piece_name(board_before, move.from_sq)
+    color = "White" if piece_char.isupper() else "Black"
+    from_sq, to_sq = move.uci()[0:2], move.uci()[2:4]
+
+    if move.is_castle:
+        side = "kingside" if (move.castle_side or "").upper() == "K" else "queenside"
+        desc = f"{color} castles {side}"
+    else:
+        captured = None
+        if move.is_en_passant:
+            captured = "pawn"
+        elif board_before.board[move.to_sq] != ".":
+            captured = _piece_name(board_before, move.to_sq)
+
+        if captured:
+            desc = f"{color} {piece_name} captures on {to_sq} (takes a {captured}), {from_sq}-{to_sq}"
+        else:
+            desc = f"{color} {piece_name} moves {from_sq}-{to_sq}"
+
+        if move.promotion:
+            desc += f", promoting to {PIECE_NAMES.get(move.promotion.lower(), move.promotion)}"
+
+    # Check status: after this move, is the side NOW to move in check?
+    if board_after.in_check(board_after.turn):
+        desc += ", delivering check"
+
+    return desc
+
+
 def _is_capture(board_before: Board, move: Move) -> bool:
     target = board_before.board[move.to_sq]
     return target != "." or move.is_en_passant
