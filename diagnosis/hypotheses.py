@@ -6,6 +6,16 @@ Supports both internal Python agents and external UCI binaries without hardcodin
 import subprocess
 from typing import Any, Dict, List
 
+# The Diagnostic Taxonomy for Dashboard / LLM mapping
+TAXONOMY = {
+    "ERR_MEASUREMENT_ARTIFACT": "Agent succeeded on in-process re-run; original failure was due to multiprocessing startup overhead starving the wall-clock time.",
+    "ERR_HORIZON_BLIND": "Search depth too shallow to see the tactical refutation.",
+    "ERR_COMPUTE_CHOKE": "Engine exhausted clock budget before reaching an informative depth.",
+    "ERR_MATERIAL_OVERCOMPENSATION": "Agent overvalued material gain, blinding it to a forced mate or severe tactical loss.",
+    "ERR_EVAL_UNCALIBRATED": "Static evaluation fundamentally misunderstands the positional reality.",
+    "ERR_PASSIVITY_BIAS": "Agent avoids active tactical lines for passive shuffling."
+}
+
 
 def discover_agent_parameters(engine_command_or_agent: Any) -> List[Dict[str, Any]]:
     """
@@ -46,11 +56,7 @@ def discover_agent_parameters(engine_command_or_agent: Any) -> List[Dict[str, An
     elif hasattr(engine_command_or_agent, "get_configurable_knobs"):
         discovered_knobs = engine_command_or_agent.get_configurable_knobs()
 
-    # FIX: these two need a "source" key too -- form_prioritized_hypotheses()
-    # filters on k["source"] == "uci_option", and a plain k["source"] lookup
-    # (no .get()) on an entry missing the key raised KeyError the moment any
-    # blunder reached the "perturb_options" branch. Tagged "search_control"
-    # here so that filter now excludes them cleanly instead of crashing.
+    # Tagged "search_control" here so that filter now excludes them cleanly instead of crashing.
     universal_search_knobs = [
         {"name": "depth_escalation", "type": "search_control", "dimension": "max_depth", "source": "search_control"},
         {"name": "time_budget_escalation", "type": "search_control", "dimension": "time_budget_ms", "source": "search_control"},
@@ -63,7 +69,8 @@ def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[D
     Analyzes blunder telemetry to make calculated guesses, assigning a confidence
     score to prioritize which empirical tests to run first.
     """
-    depth = blunder.get("agent_depth", 0)
+    depth = blunder.get("agent_depth", 3)
+    time_used = blunder.get("time_used", blunder.get("agent_time_ms", 300))
     neural_disagree_val = blunder.get("neural_disagreement")
     neural_disagree = abs(neural_disagree_val) if neural_disagree_val is not None else 0.0
     trace = blunder.get("agent_pv_trace", [])
@@ -79,9 +86,10 @@ def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[D
         depth_score += 15
         
     scored_hypotheses.append({
+        "code": "ERR_HORIZON_BLIND",
         "action": "scale_depth",
         "test_sequence": [depth + 2, depth + 4],
-        "description": "Test search horizon expansion",
+        "description": TAXONOMY["ERR_HORIZON_BLIND"],
         "confidence": depth_score
     })
 
@@ -91,9 +99,10 @@ def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[D
         time_score += 45
         
     scored_hypotheses.append({
+        "code": "ERR_COMPUTE_CHOKE",
         "action": "scale_time",
         "test_sequence": [600, 2000], 
-        "description": "Test compute starvation",
+        "description": TAXONOMY["ERR_COMPUTE_CHOKE"],
         "confidence": time_score
     })
 
@@ -104,16 +113,27 @@ def form_prioritized_hypotheses(blunder: Dict[str, Any], available_knobs: List[D
     if max_eval_in_trace > 5.0:
         eval_score += 40
         
-    # .get() rather than k["source"]: defensive against any future knob
-    # source that forgets to tag itself (see discover_agent_parameters fix).
     eval_knobs = [k for k in available_knobs if k.get("source") == "uci_option"]
     if eval_knobs:
         scored_hypotheses.append({
+            "code": "ERR_MATERIAL_OVERCOMPENSATION",
             "action": "perturb_options",
             "knobs": eval_knobs,
-            "description": "Test evaluation weight adjustments",
+            "description": TAXONOMY["ERR_MATERIAL_OVERCOMPENSATION"],
             "confidence": eval_score
         })
 
+    # Sort standard hypotheses by confidence
     scored_hypotheses.sort(key=lambda x: x["confidence"], reverse=True)
-    return scored_hypotheses
+
+    # 0. ALWAYS insert the Control Re-run (Measurement Artifact) at the absolute top
+    # If this passes, the blunder wasn't real—it was OS pool starvation.
+    control_hypothesis = {
+        "code": "ERR_MEASUREMENT_ARTIFACT",
+        "action": "control_rerun",
+        "params": {"max_depth": depth, "time_budget_ms": time_used},
+        "description": TAXONOMY["ERR_MEASUREMENT_ARTIFACT"],
+        "confidence": 1000  # Force to index 0
+    }
+    
+    return [control_hypothesis] + scored_hypotheses

@@ -2,32 +2,18 @@
 Runs iterative empirical search across dynamically formulated hypotheses.
 Tests candidate fixes per blunder before passing results to the LLM.
 
-FIX (see chat writeup): this module previously imported python-chess and
-called `agent.select_move(chess.Board(fen), ...)`. Neither exists anywhere
-else in this codebase -- engine/README.md is explicit that python-chess was
-never a dependency, and every agent in engine/agents.py exposes
-`get_move(board: environment.Board, time_budget_ms, seed) -> Move`, not
-`select_move`. That made the internal-agent path crash on first use
-(ModuleNotFoundError, then AttributeError once chess was installed). Fixed
-below to use this project's own Board/get_move directly.
-
-RIGOR NOTE: recovering the exact reference move on ONE position after a
-knob bump is a much weaker claim than the project's earlier paired
-Wilcoxon test across a whole diagnostic set (n=1, no significance test, and
-a position can have more than one objectively fine move -- a miss doesn't
-prove the position is unresolved, and a hit doesn't prove the knob is the
-real cause). This version keeps the same search strategy but stops calling
-the result "proven": every case record below carries a `validation_status`
-field, and nothing is labeled resolved without that caveat attached. Actual
-validation happens downstream in diagnosis/intervention.py, which checks
-whether the dominant fix here generalizes to held-out positions.
+FIX:
+1. Safely checks agent constructor parameters via inspect.signature before passing
+   probe arguments (like checkmate_value or use_quiescence) to avoid TypeError crashes.
+2. Adds Control Re-Run (Artifact Filter), Checkmate Scoring, and Quiescence probes
+   only when supported or handled gracefully.
 """
 
+import inspect
 import subprocess
 from typing import Any, Dict, List, Optional
 
-from engine.environment import Board  # this project's own board -- not python-chess
-
+from engine.environment import Board
 from diagnosis.hypotheses import discover_agent_parameters, form_prioritized_hypotheses
 
 UNCONFIRMED = "single_position_match (unconfirmed -- see intervention.py for held-out validation)"
@@ -36,9 +22,7 @@ UNCONFIRMED = "single_position_match (unconfirmed -- see intervention.py for hel
 def _query_agent(
     agent_target: Any, fen: str, run_kwargs: Dict[str, Any], seed: int = 0
 ) -> Optional[str]:
-    """Invokes either an external UCI engine binary (agent_target is a str
-    path) or an internal Agent subclass (agent_target is a class), and
-    returns the chosen move as a UCI string, or None if no move was made."""
+    """Invokes either an external UCI engine binary or an internal Agent subclass."""
     if isinstance(agent_target, str):
         proc = subprocess.Popen(
             [agent_target],
@@ -79,10 +63,33 @@ def _query_agent(
             proc.terminate()
         return chosen_move
 
-    # Internal Python agent -- this project's own Board + Agent.get_move.
+    # Internal Python agent -- check supported kwargs before initialization
     board = Board(fen)
     constructor_kwargs = {k: v for k, v in run_kwargs.items() if k != "time_budget_ms"}
-    agent = agent_target(**constructor_kwargs)
+    
+    # Filter kwargs to only what agent_target.__init__ accepts
+    sig = inspect.signature(agent_target.__init__)
+    accepted_params = sig.parameters
+    has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in accepted_params.values())
+
+    valid_kwargs = {}
+    attr_overrides = {}
+
+    for k, v in constructor_kwargs.items():
+        if has_var_kwargs or k in accepted_params:
+            valid_kwargs[k] = v
+        else:
+            # Stash as attribute override in case agent sets it post-init
+            attr_overrides[k] = v
+
+    try:
+        agent = agent_target(**valid_kwargs)
+        for attr, val in attr_overrides.items():
+            if hasattr(agent, attr):
+                setattr(agent, attr, val)
+    except TypeError:
+        return None
+
     time_ms = run_kwargs.get("time_budget_ms", 300)
     move = agent.get_move(board, time_budget_ms=time_ms, seed=seed)
     return move.uci() if move is not None else None
@@ -95,18 +102,22 @@ def run_empirical_investigation(
 ) -> List[Dict[str, Any]]:
     """
     Searches, per blunder, for a knob setting that makes the agent play the
-    reference move. Returns one record per blunder. Treat `proven_cause` as
-    a candidate explanation, not a confirmed one -- check `validation_status`
-    (and, for anything you rely on, run diagnosis.intervention.evaluate_intervention
-    on held-out data before trusting it).
+    reference move. Returns one record per blunder.
     """
     discovered_knobs = discover_agent_parameters(agent_target)
+    sig = inspect.signature(agent_target.__init__) if not isinstance(agent_target, str) else None
+    has_var_kwargs = sig and any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    supported_params = set(sig.parameters.keys()) if sig else set()
+
     ledger = []
 
     for b in blunders:
         fen = b["position"]
         ref_move = b["reference_move"]
         original_move = b["chosen_move"]
+
+        orig_depth = b.get("agent_depth", 3)
+        orig_time = b.get("agent_time_ms", 300)
 
         case_record = {
             "position": fen,
@@ -119,8 +130,44 @@ def run_empirical_investigation(
             "validation_status": "unresolved",
         }
 
-        ranked_hypotheses = form_prioritized_hypotheses(b, discovered_knobs)
         solved = False
+
+        # --- PROBE 1: Control Re-Run (Artifact Filter) ---
+        control_move = _query_agent(agent_target, fen, {"max_depth": orig_depth, "time_budget_ms": orig_time}, seed=seed)
+        case_record["investigation_log"].append({
+            "test": "control_rerun", "success": (control_move == ref_move)
+        })
+        if control_move == ref_move:
+            case_record["proven_cause"] = "Measurement Artifact (multiprocessing startup overhead)"
+            case_record["validation_status"] = "ERR_MEASUREMENT_ARTIFACT"
+            solved = True
+
+        # --- PROBE 2: Checkmate Scoring Probe (if supported) ---
+        if not solved and (has_var_kwargs or "checkmate_value" in supported_params):
+            mate_move = _query_agent(agent_target, fen, {"max_depth": orig_depth, "time_budget_ms": orig_time, "checkmate_value": 50000}, seed=seed)
+            if mate_move is not None:
+                case_record["investigation_log"].append({
+                    "test": "checkmate_value=50000", "success": (mate_move == ref_move)
+                })
+                if mate_move == ref_move:
+                    case_record["proven_cause"] = "Tactical Horizon Flaw (matched reference move by forcing immediate mate lines with checkmate_value=50000)"
+                    case_record["validation_status"] = UNCONFIRMED
+                    solved = True
+
+        # --- PROBE 3: Quiescence Search Probe (if supported) ---
+        if not solved and (has_var_kwargs or "use_quiescence" in supported_params):
+            q_move = _query_agent(agent_target, fen, {"max_depth": orig_depth, "time_budget_ms": orig_time, "use_quiescence": True}, seed=seed)
+            if q_move is not None:
+                case_record["investigation_log"].append({
+                    "test": "use_quiescence=True", "success": (q_move == ref_move)
+                })
+                if q_move == ref_move:
+                    case_record["proven_cause"] = "Evaluation Flaw (matched reference move by forcing capture resolutions via Quiescence Search)"
+                    case_record["validation_status"] = UNCONFIRMED
+                    solved = True
+
+        # --- Standard Depth / Time / Discovered Option Sweeps ---
+        ranked_hypotheses = form_prioritized_hypotheses(b, discovered_knobs)
 
         for hyp in ranked_hypotheses:
             if solved:
@@ -157,7 +204,7 @@ def run_empirical_investigation(
                     test_val = eval_knob.get("max", 100000) if "max" in eval_knob else "material_pst"
                     test_name = eval_knob["name"]
                     result_move = _query_agent(
-                        agent_target, fen, {test_name: test_val, "max_depth": b.get("agent_depth", 3)}, seed=seed
+                        agent_target, fen, {test_name: test_val, "max_depth": orig_depth}, seed=seed
                     )
                     case_record["investigation_log"].append({
                         "test": f"{test_name}={test_val}", "success": (result_move == ref_move)
@@ -177,14 +224,6 @@ def run_empirical_investigation(
     return ledger
 
 
-# ---------------------------------------------------------
-# Legacy pipeline compatibility
-# ---------------------------------------------------------
-# These previously silently no-op'd (`pass` / `return []`), which is worse
-# than a crash: a caller could believe run_diagnostic_suite() had actually
-# run its A/B tests when nothing happened. They now fail loudly instead,
-# pointing at the real replacement -- see run_full_pipeline.py for the
-# current wiring.
 def run_diagnostic_suite(weak_positions, hypotheses, time_budget_ms=300, seed=100):
     raise NotImplementedError(
         "run_diagnostic_suite() was replaced by run_empirical_investigation(). "

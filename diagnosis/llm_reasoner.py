@@ -1,27 +1,21 @@
 """
-LLM reasoning layer powered by Google Gemini.
+LLM reasoning layer powered by Google Gemini and Local LLMs (Ollama).
 Translates empirical diagnostic evidence and the investigation ledger into post-mortems.
 
-FIXES (see chat writeup):
+FIXES:
 1. Restored the anti-fabrication instruction ("do not invent numbers, moves,
-   or claims not present in the payload") that this version had dropped.
-   That instruction existed for a reason -- the LLM is the last line
-   between raw telemetry and a human reading a report, and this project's
-   own audit history (train/test leakage, the regret-formula bug) is
-   exactly the kind of thing an unconstrained LLM writeup would have
-   confidently narrated over instead of catching.
-2. Each proven_ledger entry now carries a `validation_status` field (see
-   diagnosis/diagnostic_experiment.py) that's either "unresolved" or
-   "single_position_match (unconfirmed -- ...)" -- never "proven" outright,
-   since a single knob bump matching one reference move once is not a
-   validated fix. The prompt now explicitly tells the model to reflect
-   that hedge in its language instead of asserting the fix "successfully
-   eliminated" anything.
+   or claims not present in the payload").
+2. Each proven_ledger entry now carries a `validation_status` field.
+3. Added semantic PV translation (`annotate_pv_line`) to cure LLM FEN-blindness.
+4. Added `call_local_reasoner` for offline, rate-limit-free diagnostics via Ollama.
+5. Added explicit tools=[] override in Gemini config to prevent AFC warnings.
 """
 
 import json
 import os
 import time
+import requests
+import chess
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
@@ -41,6 +35,9 @@ Rules:
 - Do not fabricate numbers, moves, positions, or claims that are not present in the payload. If the payload doesn't contain enough information to explain something, say so explicitly rather than guessing.
 - Every ledger entry has a `validation_status` field. If it is anything other than a fully validated/generalized result, your language MUST reflect that: use hedged phrasing ("recovered the reference move on this position", "a candidate fix") rather than assertive phrasing ("resolved", "eliminated", "fixed"). Only use confirmatory language ("resolved", "fixed") for entries explicitly marked as validated/generalized.
 - If a case's investigation_log shows no successful test, say plainly that no tested intervention explained the blunder -- do not invent one.
+- Do NOT mention general concepts like "controlling the center" or "opening diagonals" unless the specific piece that moved is directly responsible for that action. Base your tactical analysis on the semantic English PV lines provided.
+
+CRITICAL RULE: Look exactly at the 'proven_cause' string. IF IT SAYS 'No tested knob recovered the reference move', YOU MUST STATE THAT NO FIX WORKED. DO NOT INVENT A FIX.
 
 Output strict JSON only.
 
@@ -60,6 +57,49 @@ Expected JSON schema:
 }"""
 
 
+def annotate_pv_line(fen: str, uci_moves: List[str]) -> List[str]:
+    """
+    Translates raw UCI moves into semantic English descriptions.
+    Provides the LLM with tactical realities (captures, checks) it cannot "see".
+    """
+    if not isinstance(uci_moves, list) or not uci_moves:
+        return []
+
+    board = chess.Board(fen)
+    annotated_line = []
+    
+    piece_names = {
+        chess.PAWN: "Pawn", chess.KNIGHT: "Knight", chess.BISHOP: "Bishop",
+        chess.ROOK: "Rook", chess.QUEEN: "Queen", chess.KING: "King"
+    }
+
+    for uci_move in uci_moves:
+        try:
+            move = chess.Move.from_uci(uci_move)
+            if move not in board.legal_moves:
+                annotated_line.append(f"{uci_move} (Illegal move hallucinated by agent)")
+                break
+            
+            moving_piece = board.piece_at(move.from_square)
+            piece_name = piece_names[moving_piece.piece_type] if moving_piece else "Piece"
+            is_capture = board.is_capture(move)
+            
+            board.push(move)
+            is_checkmate = board.is_checkmate()
+            is_check = board.is_check()
+            
+            action = "captures on" if is_capture else "moves to"
+            target = chess.square_name(move.to_square)
+            tactical = ", Checkmate!" if is_checkmate else (", Check" if is_check else "")
+                
+            annotated_line.append(f"{uci_move} ({piece_name} {action} {target}{tactical})")
+        except Exception:
+            annotated_line.append(f"{uci_move} (Unparseable move)")
+            break
+
+    return annotated_line
+
+
 def build_evidence_payload(
     weak_dimension: str,
     weak_stats: Dict,
@@ -67,7 +107,29 @@ def build_evidence_payload(
     anomaly_summary: Optional[Dict] = None,
     proven_ledger: Optional[List[Dict]] = None,
 ) -> Dict:
-    """Builds the comprehensive diagnostic payload using proven empirical results."""
+    """Builds the comprehensive diagnostic payload using proven empirical results and semantic annotations."""
+    
+    # Enrich the ledger to cure FEN-blindness
+    enriched_ledger = []
+    for entry in (proven_ledger or []):
+        enriched = entry.copy()
+        fen = entry.get("position")
+        if fen:
+            # FIXED: Added the explicit 1-move tactical annotations for immediate checkmate/capture detection
+            ref = entry.get("reference_move")
+            orig = entry.get("original_move")
+            if ref:
+                enriched["reference_move_tactical"] = annotate_pv_line(fen, [ref])[0]
+            if orig:
+                enriched["original_move_tactical"] = annotate_pv_line(fen, [orig])[0]
+
+            # Maintained original PV line annotations as well for deeper context
+            if "agent_pv_line" in entry:
+                enriched["agent_pv_line_semantic"] = annotate_pv_line(fen, entry["agent_pv_line"])
+            if "reference_pv_line" in entry:
+                enriched["reference_pv_line_semantic"] = annotate_pv_line(fen, entry["reference_pv_line"])
+        enriched_ledger.append(enriched)
+
     return {
         "failure_pattern": f"low_decision_accuracy_in_{weak_dimension}",
         "conditions": {
@@ -78,19 +140,46 @@ def build_evidence_payload(
         },
         "classical_neural_disagreement": disagreement_stats,
         "anomaly_summary": anomaly_summary,
-        "proven_ledger": proven_ledger or [],
+        "proven_ledger": enriched_ledger,
     }
+
+
+def call_local_reasoner(
+    evidence: Dict, 
+    model_name: str = "qwen2.5:7b-instruct", 
+    host: str = "http://localhost:11434"
+) -> Dict:
+    """Sends diagnostic telemetry to a local Ollama instance."""
+    os.makedirs("data", exist_ok=True)
+    with open("data/llm_evidence_payload_local.json", "w") as f:
+        json.dump(evidence, f, indent=2)
+
+    prompt = f"{SYSTEM_PROMPT}\n\nEVIDENCE PAYLOAD:\n{json.dumps(evidence, indent=2)}"
+    
+    try:
+        response = requests.post(f"{host}/api/generate", json={
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.2, "num_ctx": 8192}
+        }, timeout=180)
+        response.raise_for_status()
+        return json.loads(response.json()["response"])
+    except Exception as e:
+        print(f"\n  [Local LLM Failed]: {e}")
+        return {
+            "interpretation": "Local LLM failed to process.",
+            "proven_fixes_summary": "Error reaching Ollama.",
+            "case_study_analysis": [],
+            "caveats": [str(e)],
+            "architectural_recommendation": "N/A"
+        }
 
 
 def call_llm_reasoner(
     evidence: Dict,
     api_key: Optional[str] = None,
-    # Reverted to gemini-3.6-flash: this version had silently downgraded to
-    # gemini-2.5-flash with no comment explaining why. An unlogged model
-    # swap changes what a report says without anyone deciding to change it
-    # -- if that downgrade was intentional (e.g. cost or availability),
-    # leave a comment saying so; if not, this is the original value,
-    # consistent with the commentary module (analysis/commentary.py).
     model_name: str = "gemini-3.6-flash"
 ) -> Dict:
     """Sends diagnostic telemetry to Gemini with exponential backoff for rate limits."""
@@ -109,10 +198,14 @@ def call_llm_reasoner(
         raise RuntimeError("GEMINI_API_KEY not configured.")
 
     client = genai.Client(api_key=key)
+    
+    # FIXED: Added tools=[] to explicitly disable automatic function calling 
+    # to prevent parsing errors when Gemini tries to call functions instead of responding
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
         temperature=0.2,
+        tools=[] 
     )
 
     max_retries = 3

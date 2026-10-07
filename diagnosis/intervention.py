@@ -11,7 +11,7 @@ from collections import Counter
 from diagnosis.diagnostic_experiment import _query_agent
 
 
-def extract_dominant_fix(proven_ledger: List[Dict]) -> Tuple[str, Dict[str, Any]]:
+def extract_dominant_fix(proven_ledger: List[Dict], min_support: int = 2) -> Tuple[str, Dict[str, Any]]:
     """
     Scans the proven ledger to find the most frequently successful parameter tweak.
     Returns a description of the fix and the exact configuration kwargs to run it.
@@ -20,6 +20,9 @@ def extract_dominant_fix(proven_ledger: List[Dict]) -> Tuple[str, Dict[str, Any]
     ledger, not statistical significance -- it tells you which knob is
     worth testing on held-out data next (evaluate_intervention below), not
     that it's already confirmed to work.
+    
+    FIX: Requires a minimum cohort support (default 2) to prevent overfitting 
+    held-out validation on a single-position fluke.
     """
     successful_tests = []
 
@@ -29,11 +32,13 @@ def extract_dominant_fix(proven_ledger: List[Dict]) -> Tuple[str, Dict[str, Any]
                 successful_tests.append(log.get("test"))
                 break  # Only count the first successful fix per position
 
-    if not successful_tests:
-        return "No candidate fix found in the diagnostic set", {}
+    counts = Counter(successful_tests)
+    # Only test on held-out data if at least `min_support` distinct positions were solved by this exact fix
+    if not counts or counts.most_common(1)[0][1] < min_support:
+        return "No generalized fix found (insufficient cohort support)", {}
 
     # Find the most common successful parameter injection
-    dominant_test_string = Counter(successful_tests).most_common(1)[0][0]
+    dominant_test_string = counts.most_common(1)[0][0]
 
     # Parse the string back into kwargs (e.g., "depth=6" -> {"max_depth": 6})
     intervention_kwargs = {}

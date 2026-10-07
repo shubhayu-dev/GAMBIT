@@ -16,21 +16,16 @@ from experiments.lichess_data import load_lichess_positions, RAW_ZST_PATH
 from engine.agents import SearchAgent
 from experiments.benchmark import diagnostic_holdout_split
 from experiments.runner import run_experiment
-from analysis.profile import build_profile  # tag_records no longer used -- see step 3/4 rewrite
+from analysis.profile import build_profile
 from analysis.anomaly import detect_anomalies
 from analysis.report import format_profile_report
-# FIX (see chat writeup): generate_hypotheses, run_diagnostic_suite/rank_hypotheses,
-# and apply_intervention_and_validate no longer exist in this version's
-# diagnosis/ modules -- these imports crashed on line 1 of execution. Updated
-# to the current API: failure_detection.extract_blunders() replaces the old
-# inline blunder-extraction code below; diagnostic_experiment.run_empirical_investigation()
-# replaces run_diagnostic_suite(); intervention.extract_dominant_fix() +
-# evaluate_intervention() replace apply_intervention_and_validate().
+
 from diagnosis.failure_detection import detect_primary_weakness, describe_weakness, extract_blunders
-from diagnosis.llm_reasoner import build_evidence_payload, call_llm_reasoner
 from diagnosis.diagnostic_experiment import run_empirical_investigation
 from diagnosis.intervention import extract_dominant_fix, evaluate_intervention
 from dashboard.report_html import build_report_html
+# FIXED: Swapped call_llm_reasoner for call_local_reasoner
+from diagnosis.llm_reasoner import build_evidence_payload, call_local_reasoner 
 
 DEVIATIONS = [
     "Evaluations use curated Lichess puzzle positions with 20-pawn clipped regret against "
@@ -42,7 +37,7 @@ DEVIATIONS = [
 
 def main():
     print("=" * 60)
-    print("GAMBIT — full pipeline run (Weeks 4-8)")
+    print("GAMBIT — full pipeline run")
     print("=" * 60)
 
     # --- 1. Load Ground Truth Data ---
@@ -99,14 +94,6 @@ def main():
         disagreement_stats = None
 
     # --- 3. Failure Detection + Empirical Investigation ---
-    # FIX (see chat writeup): this whole section previously called functions
-    # (generate_hypotheses, run_diagnostic_suite, apply_intervention_and_validate)
-    # that no longer exist in diagnosis/ -- it crashed on import before any
-    # of this ran. Rewired below to the current diagnosis API:
-    #   failure_detection.extract_blunders()          -- pick the worst blunders
-    #   diagnostic_experiment.run_empirical_investigation() -- search for fixes
-    #   intervention.extract_dominant_fix()            -- find the most common fix
-    #   intervention.evaluate_intervention()            -- check it in-sample, then held-out
     print("\n[3/6] Detecting primary weakness + isolating blunders...")
     weak_dim, weak_stats = detect_primary_weakness(profile)
     weakness_desc = describe_weakness(weak_dim, weak_stats)
@@ -118,17 +105,12 @@ def main():
     )
     print(f"  Isolated {len(blunders)} blunders (top by regret) to investigate.")
 
-    # 3a. Empirically search each blunder for a knob that recovers the
-    # reference move. NOTE: a match here is a candidate explanation, not a
-    # validated one -- see validation_status on each record, and step 4/5
-    # below where the dominant candidate is actually checked against data.
     proven_ledger = run_empirical_investigation(SearchAgent, blunders, seed=100)
     for rec in proven_ledger:
         print(f"  [{rec['validation_status']}] {rec['proven_cause']}")
 
-    # 3b. Gemini LLM reasoning over the top 2 cases (token budget), same
-    # micro-batching the original had.
-    print("\n  [LLM] Asking Gemini to reason over the investigation ledger...")
+    # FIXED: Replaced Gemini call with local Ollama
+    print("\n  [LLM] Asking local Ollama to reason over the investigation ledger...")
     llm_diagnosis = {}
     try:
         evidence = build_evidence_payload(
@@ -139,13 +121,14 @@ def main():
             proven_ledger=proven_ledger[:2],
         )
         print("\n" + "-" * 40)
-        print("  PAYLOAD BEING SENT TO GEMINI:")
+        print("  PAYLOAD BEING SENT TO LOCAL OLLAMA:")
         print(json.dumps(evidence, indent=2))
         print("-" * 40 + "\n")
-        llm_diagnosis = call_llm_reasoner(evidence)
-
+        
+        # Pointed directly to Qwen2.5 as instructed
+        llm_diagnosis = call_local_reasoner(evidence, model_name="qwen2.5:14b")
         print("\n" + "─" * 50)
-        print(" GEMINI DIAGNOSIS")
+        print(" LOCAL LLM DIAGNOSIS")
         print("─" * 50)
         print(f" Interpretation:      {llm_diagnosis.get('interpretation')}")
         print(f" Proven fixes summary: {llm_diagnosis.get('proven_fixes_summary')}")
@@ -165,11 +148,6 @@ def main():
     except Exception as e:
         print(f"  [LLM Skipped]: {e}")
 
-    # Adapter: dashboard/report_html.py expects the OLD llm_diagnosis shape
-    # (interpretation/best_supported_hypothesis/case_study_analysis[].diagnosis).
-    # Rather than rewrite report_html.py's rendering (out of scope for this
-    # fix), translate the new schema into the old field names it reads, so
-    # the dashboard keeps working unmodified.
     llm_diagnosis_for_report = dict(llm_diagnosis) if llm_diagnosis else {}
     if llm_diagnosis:
         llm_diagnosis_for_report["best_supported_hypothesis"] = llm_diagnosis.get("proven_fixes_summary")
@@ -197,11 +175,6 @@ def main():
         diagnostic_check = {}
         print("  No candidate fix to check -- no investigation_log entry recovered a reference move.")
 
-    # Adapter: report_html.py's hyp_rows table wants a list of dicts shaped
-    # like the old H1/H2/H3 rows. We only have one candidate now (the
-    # dominant fix), so it's a single row. p_value is deliberately left
-    # None -- there is no significance test in this methodology, and
-    # reporting a fabricated one would be worse than reporting none.
     ranked = [{
         "hypothesis": "Empirical",
         "label_a": "baseline",
@@ -215,9 +188,6 @@ def main():
     # --- 5. Held-out validation of the dominant fix ---
     print("\n[5/6] Validating the dominant fix on held-out positions never used above...")
     if intervention_kwargs:
-        # `holdout` positions come from diagnostic_holdout_split() with raw
-        # Lichess field names (fen / reference_move_lichess); evaluate_intervention
-        # expects the run_experiment record shape (position / reference_move).
         holdout_for_eval = [
             {"position": p["fen"], "reference_move": p.get("reference_move_lichess")}
             for p in holdout
