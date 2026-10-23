@@ -1,185 +1,189 @@
 # GAMBIT
-Game-theoretic Agent Monitoring and Behavior Intervention Testbed
 
-An AI agent evaluation and diagnostic framework. Chess is the first environment —
-not the point of the project. The point is the closed loop:
+**Game-theoretic Agent Monitoring and Behavior Intervention Testbed**
+
+An evaluation and diagnostic framework for AI agents. Chess is the first environment, not the point of the project. The point is the closed loop:
 
 ```
 OBSERVE → EVALUATE → DIAGNOSE → EXPERIMENT → INTERVENE → VALIDATE
+   ▲                                                          │
+   └──────────────────────────────────────────────────────────┘
 ```
+
+Instead of reporting "the agent scored X", GAMBIT asks *where* an agent fails, *why*, whether a proposed fix actually works, and whether that fix generalizes to held-out data.
+
+> **Status: research prototype, audited, not yet ready to scale.** The full loop runs end to end on self-play data plus a small real Lichess sample. Several early findings were later overturned by audit. See [Status and honest limitations](#status-and-honest-limitations) before trusting any number in this repo.
+
+---
+
+## Contents
+
+- [Start here](#start-here)
+- [Quick start](#quick-start)
+- [How the loop works](#how-the-loop-works)
+- [Repository layout](#repository-layout)
+- [Key components](#key-components)
+- [Status and honest limitations](#status-and-honest-limitations)
+- [What the audit found](#what-the-audit-found)
+- [Known deviations](#known-deviations)
+- [Roadmap](#roadmap)
+- [Documentation index](#documentation-index)
+
+---
 
 ## Start here
-1. Read `PROJECT_CONSTITUTION.md` first — paste it into any LLM session about
-   this project. It's the source of truth on scope.
-2. Read `/docs` in order (01 → 10) for the full Week 0 design.
 
-## Repo layout
+1. Read **`PROJECT_CONSTITUTION.md`** first. It is the source of truth on scope. Paste it into any LLM session about this project.
+2. Read **`docs/`** in order (01 → 10) for the Week 0 design.
+3. Read **`docs/12_audit_report.md`** through **`docs/15_audit_round3.md`** before relying on any result. They supersede several earlier claims.
+4. The final report from the main pipeline run is `data/gambit_report.html`.
+
+## Quick start
+
+See **`SETUP.md`** for environment setup, including running a local Ollama model for move commentary.
+
+```bash
+# End-to-end move commentary demo (local Ollama by default; Gemini also supported)
+python analysis/run_commentary_demo.py
+```
+
+The regret audit tests are runnable directly:
+
+```bash
+python diagnosis/test_regret_audit.py
+```
+
+The full diagnostic pipeline entry point is `diagnosis/run_full_pipeline.py`.
+
+## How the loop works
+
+| Stage | What happens | Where |
+|---|---|---|
+| **Observe** | Agents play games; every decision is logged as a trajectory (SQLite + JSONL) | `engine/`, `experiments/` |
+| **Evaluate** | Per-move regret against a reference move, decision accuracy by game phase, behavioral profiles | `analysis/`, `experiments/runner.py` |
+| **Diagnose** | Per-blunder empirical search: does some knob setting recover the reference move on this exact position? | `diagnosis/` |
+| **Experiment** | Controlled comparisons (e.g. search depth 2 vs 4) with real node counts | `diagnosis/`, `experiments/` |
+| **Intervene** | Apply a candidate fix to the agent | `diagnosis/intervention.py` |
+| **Validate** | Check the fix on a held-out set. Only this step earns the word "generalized" | `diagnosis/intervention.py` |
+
+Every ledger entry from `diagnostic_experiment.run_empirical_investigation()` carries an explicit `validation_status` and is never silently "proven". A knob bump that fixes one position is a much weaker claim than a statistical test across a diagnostic set. Read the module docstring of `diagnosis/diagnostic_experiment.py` before trusting any case study's `proven_cause`.
+
+## Repository layout
+
 ```
 GAMBIT/
-├── PROJECT_CONSTITUTION.md
-├── docs/            # design specs (01-10)
-├── engine/          # C++ core: board, moves, search, eval, agents
-├── experiments/     # experiment runner, parallel execution
-├── analysis/        # metrics, statistics, behavioral profiling,
-│                    # move commentary (commentary.py, rule_based_commentary.py,
-│                    # commentary_report.py, run_commentary_demo.py)
-├── diagnosis/        # hypothesis generation, diagnostic experiments
-├── dashboard/       # Streamlit UI
-└── data/            # SQLite + Parquet + JSON (gitignored bulk data)
+├── PROJECT_CONSTITUTION.md   # scope and source of truth
+├── SETUP.md                  # environment + Ollama setup
+├── CHANGE_LOG.md             # bug fixes with verification notes
+├── docs/                     # design specs (01-10), addenda and audits (11-15)
+├── engine/                   # chess rules, search, evaluation, agents
+├── experiments/              # runner, parallel execution, Lichess data loader
+├── analysis/                 # metrics, statistics, behavioral profiling,
+│                             #   move commentary (see below)
+├── diagnosis/                # hypothesis generation, diagnostic experiments,
+│                             #   interventions, LLM reasoning layer
+├── dashboard/                # Streamlit UI (see Known deviations)
+└── data/                     # SQLite + JSONL + CSV (bulk data gitignored)
 ```
 
-## Status
-- Week 0 (design): complete.
-- Week 1 (chess environment): complete — pure-Python rules engine,
-  perft-verified through depth 4, baseline agents, full-loop demo.
-- Week 2 (search agent): complete — iterative-deepening alpha-beta with
-  piece-square-table evaluation (`engine/search.py`, `engine/evaluation.py`);
-  `SearchAgent` finds forced mates, takes free material, beats random play.
-- Week 3 (experiment framework): complete — self-play benchmark generation,
-  diagnostic/held-out split, parallel experiment runner
-  (`experiments/runner.py`), SQLite + JSONL trajectory logging.
+> Note: earlier versions of this README described `engine/` as a "C++ core". The implemented engine is pure Python. Update the Constitution if the C++ plan still stands.
 
-See `docs/10_development_plan.md` for full details and three noted
-deviations, all caused by no network access in this sandbox: Stockfish and
-python-chess (Week 1), and pyarrow/Parquet + real Lichess benchmark data
-(Week 3). Each has a documented drop-in fix for whenever the team has network
-access — none require touching the Agent interface or data schema.
+## Key components
 
-**All 8 weeks complete.** Full loop (OBSERVE → EVALUATE → DIAGNOSE →
-EXPERIMENT → INTERVENE → VALIDATE) runs end to end against real
-(self-play-generated) data — see `docs/10_development_plan.md` for the
-full week-by-week write-up, including two honest null/inconclusive results
-(Week 6 diagnostic experiments, Week 7 intervention validation) that are
-reported as-is rather than dressed up. Final report: `data/gambit_report.html`.
+### Chess environment and agents (Weeks 1-2)
+- Pure-Python rules engine, perft-verified through depth 4.
+- Baseline agents, including random play.
+- `SearchAgent`: iterative-deepening alpha-beta with piece-square-table evaluation (`engine/search.py`, `engine/evaluation.py`). Finds forced mates, takes free material, beats random play.
 
-Five noted deviations, all caused by no network access in this sandbox
-(Stockfish/python-chess, real Lichess benchmark data, pyarrow/Parquet,
-Streamlit) are documented in `docs/10_development_plan.md` with concrete
-swap-in instructions for each — none require touching the Agent interface
-or trajectory schema.
+### Experiment framework (Week 3)
+- Self-play benchmark generation with a diagnostic / held-out split.
+- Parallel experiment runner (`experiments/runner.py`).
+- SQLite + JSONL trajectory logging.
+- 96 validated real Lichess puzzle positions (`data/lichess_puzzles_sample.csv`, `experiments/lichess_data.py`), sourced from the official Lichess dataset on HuggingFace.
 
-**Integration addendum (scope change, flagged explicitly):** a neural (MLP)
-value agent, classical-vs-neural disagreement analysis, IsolationForest
-anomaly detection, and a real-but-not-live LLM reasoning layer were added —
-see `docs/11_integration_addendum.md` for what changed and why it's still
-within the constitution's spirit.
+### Diagnosis pipeline
+Reworked from paired-hypothesis statistical testing to a per-blunder empirical search. The rewrite initially shipped with breaking bugs (dependence on python-chess and a nonexistent `select_move()`, a `KeyError` in `hypotheses.py`, mixed regret metrics in `intervention.py`, stale calls in `run_full_pipeline.py`). All were fixed and verified against the real engine. See `CHANGE_LOG.md`.
 
-**Audit (do this before trusting anything above): `docs/12_audit_report.md`.**
-Before scaling the dataset, the whole pipeline was audited for correctness
-instead of extended further. Two big findings:
-1. **The regret formula was bugged** — it never used the `reference_move`
-   field it stored, and was proven wrong with constructed test positions
-   (`diagnosis/test_regret_audit.py`). Fixed in `experiments/runner.py`.
-   Re-running the exact same 12 positions with the fix **reversed** the
-   Week 5 "middlegame is the weakness" finding — middlegame went from 0% to
-   100% decision accuracy, and Opening is now the actual weak dimension.
-2. **The neural value model is worse than simple hand-coded baselines**
-   (MAE 2.957 vs. 2.163 for the plain classical evaluator) at predicting its
-   own training target — it should not be trusted as an improvement over
-   classical evaluation, including in the disagreement analysis.
+### Integration addendum (scope change, flagged)
+A neural (MLP) value agent, classical-vs-neural disagreement analysis, IsolationForest anomaly detection, and a real-but-not-live LLM reasoning layer. Details and rationale: `docs/11_integration_addendum.md`. **The neural model is currently shelved as untrustworthy** (see audit findings).
 
-Also confirmed explicitly for the record: **all data in this project so far
-is self-play generated, zero positions come from Lichess** — getting real
-Lichess data remains a standing, unaddressed action item.
+### Move commentary system
+A separate subsystem in `analysis/`, deliberately not part of `diagnosis/llm_reasoner.py` (that module feeds the DIAGNOSE step; commentary narrates moves for a human reader).
 
-One controlled experiment (search depth 2 vs 4, corrected metric, real node
-counts) was run properly and found no support for the depth hypothesis — no
-intervention was built on it, since doing so without supporting evidence
-would defeat the point of the audit. Full next-steps for scaling are in
-`docs/12_audit_report.md` section 14.
+| File | Role |
+|---|---|
+| `rule_based_commentary.py` | Filters out moves that need no LLM: only legal move, forced check replies, simple recaptures, mate |
+| `commentary.py` | Batches the rest into a strict-JSON LLM call. Providers: Ollama (default, `qwen2.5:7b-instruct`) or Gemini. Retries moves a batch dropped, one at a time |
+| `commentary_report.py` | Renders a browser-openable HTML report: board snapshot, tag, explanation per move |
+| `run_commentary_demo.py` | End-to-end runnable driver |
 
-**Phase 2 of the audit (this round): real Lichess data + neural model fix.**
-`lichess.org` and `raw.githubusercontent.com` both block automated fetching
-(confirmed directly, `ROBOTS_DISALLOWED`) — but the official Lichess dataset
-on HuggingFace doesn't, so 96 real, validated Lichess puzzle positions are
-now integrated (`data/lichess_puzzles_sample.csv`,
-`experiments/lichess_data.py`). Testing on real data immediately found a
-SECOND bug: unclipped mate scores blew mean regret up to 14,584 on real
-puzzles (self-play data never triggered this). Fixed the same way as the
-neural model's training target. Separately, fixing the neural model's
-train/test split to be game-level (not position-level) revealed the
-original result was leaky: true test R² is **-0.074**, and the neural model
-is now worse than every baseline including a constant predictor. Full
-writeup: `docs/13_lichess_integration.md` and `docs/14_final_audit_summary.md`
-(files changed, tests added, commands, dataset/model stats, and exact next
-steps, as requested).
+**Why the explanations are honest:** `engine/search.py` captures a `root_trace` during the live, time-bounded search that chose the move. It records every root move actually compared, plus whether the deadline cut that comparison short (`fully_searched: false`). The engine runs on a wall-clock budget, so it may compare only 3-4 of 25-30 legal moves in the middlegame. Reconstructing alternatives with a fresh unconstrained re-search would make the played move look like it lost to options the live search never reached. `evaluate_root_candidates()` remains only for the different question "what would unlimited time have found?" and is not used for commentary.
 
-**Phase 3 (this round): mate-handling stress tests + root-causing the neural
-failure + a READY/NOT READY call.** 10 constructed mate-score test cases
-all pass (no mate / reference-exact / mate found or missed / mate-in-1 /
-mate-in-2 via a real puzzle / both sides / White & Black to move), with
-sign conventions verified consistent throughout — and an explicit statement
-that clipped mate regret is a **bounded approximation**, not exact regret.
-Root-caused *why* the neural model fails (not just that it does): overfitting
-from 106,881 parameters on ~1,400 unique training examples is the primary
-cause, on top of a target that's inherently hard to fit even for the
-hand-coded baselines (a 2-ply-search target vs. 0-ply static evaluators).
-Also found the `game_phase()` heuristic is systematically miscalibrated
-(76% agreement with real Lichess tags, one-directional — always
-under-detects endgames), and decided how to handle it going forward (store
-both classifiers separately, don't silently prefer one).
+## Status and honest limitations
 
-**Formal decision: NOT READY to scale from 96 to 500-2000 positions yet.**
-Two blocking issues first: the neural model needs to either shrink, get much
-more data, or be shelved until a better target exists; and `game_phase()`
-needs recalibrating against the real data now available as ground truth.
-Full report, including the complete claims-and-confidence table and exact
-next steps: `docs/15_audit_round3.md`.
+| Week | Scope | Status |
+|---|---|---|
+| 0 | Design | Complete |
+| 1 | Chess environment | Complete |
+| 2 | Search agent | Complete |
+| 3 | Experiment framework | Complete |
+| 4-8 | Metrics → diagnosis → intervention → validation → report | Complete; two null/inconclusive results reported as-is (Week 6 diagnostic experiments, Week 7 intervention validation) |
+| Audit rounds 1-3 | Correctness audit | Complete |
+| Scaling to 500-2000 positions | | **NOT READY** (two blockers below) |
 
-## Diagnosis pipeline fixes (this round)
-The diagnosis pipeline (`diagnosis/`) was reworked from paired-hypothesis
-statistical testing to a per-blunder empirical search ("does some knob
-setting recover the reference move on this exact position"), and the
-rewrite shipped with several breaking bugs: `diagnostic_experiment.py`
-depended on `python-chess` and a `select_move()` method neither exists
-anywhere in this codebase (real agents expose `get_move(environment.Board,
-...)`); `hypotheses.py` had a `KeyError` on any knob missing a `source` key;
-`intervention.py` compared two different regret metrics (continuous vs.
-binary-match) in the same subtraction; and `run_full_pipeline.py` still
-called four functions removed from the new API. All fixed — see
-`CHANGE_LOG.md` for the full list, each verified against the real engine,
-not just import-checked.
+**Blocking issues before scaling:**
+1. The neural model must shrink, get far more data, or be shelved until a better target exists.
+2. `game_phase()` must be recalibrated against real Lichess tags.
 
-**Methodology note carried into the fix, not resolved by it:** a knob bump
-that makes the agent match the reference move on ONE position is a much
-weaker claim than the old paired Wilcoxon test across a diagnostic set.
-Every ledger entry from `diagnostic_experiment.run_empirical_investigation()`
-now carries an explicit `validation_status` (never silently "proven"), and
-`intervention.py`'s held-out check is what actually earns the word
-"generalized" — read `diagnosis/diagnostic_experiment.py`'s module docstring
-before trusting a case study's `proven_cause` field at face value.
+**Data provenance:** all positions outside the 96-position Lichess sample are self-play generated.
 
-## Move commentary system (this round)
-A new, separate subsystem — deliberately NOT part of `diagnosis/llm_reasoner.py`,
-since that module's job is feeding the DIAGNOSE step, not narrating individual
-moves for a human reading a game. Lives in `analysis/`:
+## What the audit found
 
-- `rule_based_commentary.py` — filters out moves that don't need an LLM at
-  all (only-legal-move, forced check replies, simple recaptures, mate).
-- `commentary.py` — batches whatever's left into a strict-JSON LLM call.
-  Supports both Gemini (`provider="gemini"`) and a local Ollama model
-  (`provider="ollama"`, default, currently `qwen2.5:7b-instruct`) — see
-  `SETUP.md` for getting Ollama running. Auto-retries any move a batch
-  response dropped, one at a time, since smaller local models don't
-  reliably cover every item in a multi-move JSON array.
-- `commentary_report.py` — renders the result as an actual browser-openable
-  HTML report (per-move board snapshot, tag, explanation), not just
-  terminal output.
-- `run_commentary_demo.py` — end-to-end runnable driver; see `SETUP.md`.
+Read these before quoting any earlier result.
 
-**The key design decision, and the thing that makes the explanations
-actually answer "why did the agent do this"**: `engine/search.py`'s
-`alpha_beta()`/`search_best_move()` now optionally capture `root_trace` —
-every root move the search *actually compared* in the same live,
-time-bounded call that chose the move, including whether the deadline cut
-that comparison short (`fully_searched: false`). This engine runs on a
-wall-clock time budget, not a fixed node count, and it's common for the
-search to compare only a handful of the legal moves available before time
-runs out — sometimes as few as 3-4 out of 25-30 in the middlegame. An
-earlier version of this reconstructed "alternatives" with a fresh,
-unconstrained re-search instead of capturing this live — that produces a
-*different and less honest* comparison (it can make the played move look
-like it lost to options the live search never even reached), so
-`evaluate_root_candidates()` in `search.py` is kept only for the different
-question "what would unlimited time have found," clearly labeled as such,
-and is not used for commentary.
+| Finding | Impact |
+|---|---|
+| **Regret formula bug.** It never used the stored `reference_move`. Proven wrong with constructed positions (`diagnosis/test_regret_audit.py`) and fixed in `experiments/runner.py` | Reversed the Week 5 conclusion. Middlegame went from 0% to 100% decision accuracy; **Opening** is the actual weak dimension |
+| **Unclipped mate scores.** Found by testing on real Lichess puzzles: mean regret reached 14,584 | Fixed by clipping, as for the neural target. Clipped mate regret is a bounded approximation, not exact regret. 10 constructed mate cases pass, with sign conventions verified |
+| **Neural model leakage.** Position-level split leaked across games | With a game-level split, test R² is **-0.074**, worse than every baseline including a constant predictor. Root cause: 106,881 parameters on ~1,400 unique examples, plus a hard 2-ply-search target |
+| **`game_phase()` miscalibration** | 76% agreement with real Lichess tags, always under-detecting endgames. Both classifiers are now stored separately rather than silently preferring one |
+| **Depth hypothesis** (search depth 2 vs 4, corrected metric, real node counts) | No support found. No intervention was built on it |
+
+Full write-ups: `docs/12_audit_report.md`, `docs/13_lichess_integration.md`, `docs/14_final_audit_summary.md`, `docs/15_audit_round3.md` (includes the claims-and-confidence table and exact next steps).
+
+## Known deviations
+
+Caused by no network access in the original build sandbox. Each has a documented drop-in fix in `docs/10_development_plan.md` and none requires changing the Agent interface or trajectory schema.
+
+- Stockfish and python-chess (a pure-Python engine is used instead)
+- Real Lichess benchmark data at scale (only 96 puzzles integrated so far)
+- pyarrow / Parquet (SQLite + JSONL used instead)
+- Streamlit dashboard (not run in the sandbox)
+- A live LLM reasoning layer (implemented, not run live)
+
+Note: `lichess.org` and `raw.githubusercontent.com` block automated fetching. The HuggingFace mirror of the official dataset does not.
+
+## Roadmap
+
+1. Recalibrate `game_phase()` against Lichess ground truth.
+2. Resolve the neural model (shrink, add data, or shelve).
+3. Scale from 96 to 500-2000 real positions.
+4. Re-run diagnostic experiments on the corrected metric and real data.
+5. Swap in Stockfish as the reference engine.
+6. Validate any proposed intervention on held-out data before making claims.
+
+Exact next steps: `docs/12_audit_report.md` §14 and `docs/15_audit_round3.md`.
+
+## Documentation index
+
+| Doc | Contents |
+|---|---|
+| `PROJECT_CONSTITUTION.md` | Scope, principles, source of truth |
+| `docs/01`-`10` | Week 0 design and week-by-week development plan |
+| `docs/11_integration_addendum.md` | Neural agent, anomaly detection, LLM layer |
+| `docs/12_audit_report.md` | First correctness audit |
+| `docs/13_lichess_integration.md` | Real data integration |
+| `docs/14_final_audit_summary.md` | Files changed, tests, commands, stats |
+| `docs/15_audit_round3.md` | Mate tests, neural root cause, READY/NOT READY decision |
+| `CHANGE_LOG.md` | Diagnosis pipeline fixes |
+| `SETUP.md` | Environment and Ollama setup |
